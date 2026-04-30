@@ -16,6 +16,10 @@ import pyarrow.parquet as pq
 DATASET_NAME = "jdopensource/JoyAI-Image-OpenSpatial"
 ROLE_MAP = {"human": "user", "gpt": "assistant"}
 IMAGE_FORMAT = "image/jpeg"
+CATEGORY_KEYS = ("category", "sub_category", "subcategory", "ability", "task", "label")
+IMAGE_TOKEN_RE = re.compile(r"\s*<image>\s*", flags=re.IGNORECASE)
+WHITESPACE_RE = re.compile(r"\s+")
+PATH_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
 @dataclass
@@ -81,8 +85,8 @@ def parse_meta_info(meta_info_raw: Any) -> Any:
 
 def normalize_question_text(text: Any) -> str:
     raw = "" if text is None else str(normalize_scalar(text))
-    raw = re.sub(r"\s*<image>\s*", " ", raw, flags=re.IGNORECASE)
-    raw = re.sub(r"\s+", " ", raw)
+    raw = IMAGE_TOKEN_RE.sub(" ", raw)
+    raw = WHITESPACE_RE.sub(" ", raw)
     return raw.strip().lower()
 
 
@@ -232,19 +236,19 @@ def infer_subtask_from_row(row: Dict[str, Any]) -> Optional[str]:
 
 
 def extract_category(row: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
-    for key in ("category", "sub_category", "subcategory", "ability", "task", "label"):
+    for key in CATEGORY_KEYS:
         if key in row and row[key] not in (None, ""):
             return key, str(row[key])
 
     meta_info = parse_meta_info(row.get("meta_info"))
     if isinstance(meta_info, dict):
-        for key in ("category", "sub_category", "subcategory", "ability", "task", "label"):
+        for key in CATEGORY_KEYS:
             if key in meta_info and meta_info[key] not in (None, ""):
                 return f"meta_info.{key}", str(meta_info[key])
     if isinstance(meta_info, list):
         for item in meta_info:
             if isinstance(item, dict):
-                for key in ("category", "sub_category", "subcategory", "ability", "task", "label"):
+                for key in CATEGORY_KEYS:
                     if key in item and item[key] not in (None, ""):
                         return f"meta_info[].{key}", str(item[key])
     inferred = infer_subtask_from_row(row)
@@ -262,15 +266,12 @@ def ensure_bytes(image_value: Any) -> bytes:
     if isinstance(image_value, memoryview):
         return image_value.tobytes()
     if isinstance(image_value, str):
-        try:
-            return base64.b64decode(image_value)
-        except Exception:
-            return image_value.encode("utf-8")
+        return base64.b64decode(image_value)
     raise TypeError(f"Unsupported image bytes type: {type(image_value)}")
 
 
 def sanitize_for_path(value: str) -> str:
-    sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", value)
+    sanitized = PATH_SAFE_RE.sub("_", value)
     return sanitized.strip("._") or "sample"
 
 
@@ -286,62 +287,36 @@ def build_tar_relative_path(sample_id: str, img_idx: int) -> str:
     return filename
 
 
-def load_image_bytes(image_obj: Dict[str, Any]) -> Tuple[Optional[bytes], Optional[str]]:
+def load_image_bytes(image_obj: Dict[str, Any]) -> Optional[bytes]:
     bytes_value = image_obj.get("bytes")
     if bytes_value not in (None, "", b""):
         try:
-            return ensure_bytes(bytes_value), "bytes"
+            return ensure_bytes(bytes_value)
         except Exception:
             pass
-    return None, None
+    return None
 
 
 def strip_image_placeholder_tokens(text: str) -> str:
-    # Keep text readable after removing modality placeholders.
-    text = re.sub(r"\s*<image>\s*", " ", text, flags=re.IGNORECASE)
-    return re.sub(r"[ \t]+", " ", text).strip()
+    text = IMAGE_TOKEN_RE.sub(" ", text)
+    return WHITESPACE_RE.sub(" ", text).strip()
 
 
-def convert_to_jpeg_bytes(image_bytes: bytes) -> bytes:
+def convert_to_jpeg_and_get_size(image_bytes: bytes) -> Tuple[bytes, int, int]:
     try:
         from PIL import Image  # pyright: ignore[reportMissingImports]
 
         with Image.open(io.BytesIO(image_bytes)) as img:
+            width, height = img.width, img.height
             if img.mode in ("RGBA", "LA", "P"):
                 img = img.convert("RGB")
             elif img.mode != "RGB":
                 img = img.convert("RGB")
             buf = io.BytesIO()
             img.save(buf, format="JPEG", quality=95)
-            return buf.getvalue()
+            return buf.getvalue(), width, height
     except Exception:
-        return image_bytes
-
-
-def infer_image_size(image_bytes: bytes) -> Tuple[Optional[int], Optional[int]]:
-    try:
-        from PIL import Image  # pyright: ignore[reportMissingImports]
-
-        with Image.open(io.BytesIO(image_bytes)) as img:
-            return img.width, img.height
-    except Exception:
-        return None, None
-
-
-def width_height_from_meta(meta_info: Any, idx: int) -> Tuple[Optional[int], Optional[int]]:
-    parsed = parse_meta_info(meta_info)
-    if isinstance(parsed, list) and idx < len(parsed) and isinstance(parsed[idx], dict):
-        item = parsed[idx]
-        w = item.get("width")
-        h = item.get("height")
-        if isinstance(w, int) and isinstance(h, int):
-            return w, h
-    if isinstance(parsed, dict):
-        w = parsed.get("width")
-        h = parsed.get("height")
-        if isinstance(w, int) and isinstance(h, int):
-            return w, h
-    return None, None
+        return image_bytes, -1, -1
 
 
 def to_role(raw_role: Any) -> Optional[str]:
@@ -367,19 +342,15 @@ def build_pangu_sample(
     sample_id = make_sample_id(row, row_index)
     conversations = normalize_scalar(row.get("conversations")) or []
     images = normalize_scalar(row.get("images")) or []
-    meta_info = row.get("meta_info")
-
     if not conversations:
         return None
 
     turns: List[Dict[str, Any]] = []
     for i, turn in enumerate(conversations):
-        if isinstance(turn, dict):
-            from_role = turn.get("from")
-            value = turn.get("value")
-        else:
-            from_role = normalize_scalar(turn.get("from")) if turn else None
-            value = normalize_scalar(turn.get("value")) if turn else None
+        if not isinstance(turn, dict):
+            return None
+        from_role = turn.get("from")
+        value = turn.get("value")
 
         role = to_role(from_role)
         if role is None:
@@ -400,21 +371,15 @@ def build_pangu_sample(
         image_obj = normalize_scalar(image_obj)
         if not isinstance(image_obj, dict):
             continue
-        source_image_bytes, _source = load_image_bytes(image_obj)
+        source_image_bytes = load_image_bytes(image_obj)
         if source_image_bytes is None:
             continue
-        image_bytes = convert_to_jpeg_bytes(source_image_bytes)
+        image_bytes, width, height = convert_to_jpeg_and_get_size(source_image_bytes)
         tar_relative_path = build_tar_relative_path(sample_id, img_idx)
 
         tar_info = tarfile.TarInfo(name=tar_relative_path)
         tar_info.size = len(image_bytes)
         shard_tar.addfile(tarinfo=tar_info, fileobj=io.BytesIO(image_bytes))
-
-        width, height = width_height_from_meta(meta_info, img_idx)
-        if width is None or height is None:
-            width, height = infer_image_size(source_image_bytes)
-        if width is None or height is None:
-            width, height = -1, -1
 
         first_user_content.append(
             {
@@ -435,7 +400,7 @@ def build_pangu_sample(
         if idx == 0:
             content.extend(first_user_content)
         text_value = turn["text"]
-        if idx == 0 and first_user_content:
+        if idx == 0:
             text_value = strip_image_placeholder_tokens(text_value)
         content.append(to_text_content(text_value))
         data.append({"role": turn["role"], "content": content})
@@ -447,8 +412,13 @@ def iter_parquet_rows(parquet_files: Iterable[Path], batch_size: int) -> Iterabl
     for parquet_file in parquet_files:
         pf = pq.ParquetFile(parquet_file)
         for batch in pf.iter_batches(batch_size=batch_size):
-            records = batch.to_pylist()
-            for row in records:
+            column_names = list(batch.schema.names)
+            columns = [batch.column(i) for i in range(batch.num_columns)]
+            for row_idx in range(batch.num_rows):
+                row: Dict[str, Any] = {}
+                for name, column in zip(column_names, columns):
+                    value = column[row_idx]
+                    row[name] = value.as_py() if hasattr(value, "as_py") else value
                 yield row
 
 
@@ -513,8 +483,6 @@ def main() -> None:
             data_source_counter[data_source] += 1
 
             category_field, category_value = extract_category(row)
-            if not category_value:
-                category_value = infer_subtask_from_row(row) or "unknown.single_view"
             if category_value:
                 if stats.category_field is None:
                     stats.category_field = category_field or "inferred_subtask_from_prompt"

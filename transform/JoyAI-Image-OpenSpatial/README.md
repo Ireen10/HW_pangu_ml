@@ -54,6 +54,7 @@
 
 - `relative_path = {safe_sample_id}_{image_idx:02d}.jpg`
 - 不按 sample 建子目录，避免 tar 内大量小目录。
+- `width/height` 固定从图像字节解析，不使用 `meta_info` 尺寸字段。
 
 ### E. 会不会有“对话轮次不合法”的样本？
 

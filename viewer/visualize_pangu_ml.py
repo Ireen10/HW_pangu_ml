@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import io
+import json
+import tarfile
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import streamlit as st
+
+
+def _shard_id_from_name(path: Path) -> Optional[str]:
+    stem = path.stem  # data_000000
+    if not stem.startswith("data_"):
+        return None
+    return stem.split("_", 1)[1]
+
+
+@st.cache_data(show_spinner=False)
+def build_shard_index(root_path: str) -> List[Dict[str, Any]]:
+    root = Path(root_path)
+    images_dir = root / "images"
+    jsonl_dir = root / "jsonl"
+    if not images_dir.exists() or not jsonl_dir.exists():
+        return []
+
+    tar_map: Dict[str, Path] = {}
+    for tar_path in sorted(images_dir.glob("data_*.tar")):
+        shard_id = _shard_id_from_name(tar_path)
+        if shard_id is not None:
+            tar_map[shard_id] = tar_path
+
+    shards: List[Dict[str, Any]] = []
+    running_start = 0
+    for jsonl_path in sorted(jsonl_dir.glob("data_*.jsonl")):
+        shard_id = _shard_id_from_name(jsonl_path)
+        if shard_id is None:
+            continue
+        tar_path = tar_map.get(shard_id)
+        if tar_path is None:
+            continue
+
+        line_count = 0
+        with jsonl_path.open("r", encoding="utf-8") as f:
+            for _ in f:
+                line_count += 1
+
+        shards.append(
+            {
+                "shard_id": shard_id,
+                "jsonl_path": jsonl_path,
+                "tar_path": tar_path,
+                "line_count": line_count,
+                "start_index": running_start,
+                "end_index": running_start + line_count - 1,
+            }
+        )
+        running_start += line_count
+    return shards
+
+
+def total_samples(shards: List[Dict[str, Any]]) -> int:
+    return sum(int(s["line_count"]) for s in shards)
+
+
+def find_shard_for_index(shards: List[Dict[str, Any]], index: int) -> Optional[Dict[str, Any]]:
+    for shard in shards:
+        if int(shard["start_index"]) <= index <= int(shard["end_index"]):
+            return shard
+    return None
+
+
+@st.cache_data(show_spinner=False)
+def get_row_from_jsonl(jsonl_path: str, line_idx: int) -> Optional[Dict[str, Any]]:
+    path = Path(jsonl_path)
+    with path.open("r", encoding="utf-8") as f:
+        for idx, line in enumerate(f):
+            if idx == line_idx:
+                line = line.strip()
+                if not line:
+                    return None
+                return json.loads(line)
+    return None
+
+
+@st.cache_data(show_spinner=False)
+def get_image_bytes_from_tar(tar_path: str, relative_path: str) -> Optional[bytes]:
+    try:
+        with tarfile.open(tar_path, "r") as tf:
+            member = tf.getmember(relative_path)
+            f = tf.extractfile(member)
+            if f is None:
+                return None
+            return f.read()
+    except Exception:
+        return None
+
+
+def extract_image_entries(sample: Dict[str, Any]) -> List[Dict[str, Any]]:
+    data = sample.get("data") or []
+    if not data:
+        return []
+    first_user = data[0]
+    if first_user.get("role") != "user":
+        return []
+    content = first_user.get("content") or []
+    images: List[Dict[str, Any]] = []
+    for part in content:
+        if isinstance(part, dict) and part.get("type") == "image":
+            image_obj = part.get("image")
+            if isinstance(image_obj, dict):
+                images.append(image_obj)
+    return images
+
+
+def extract_turn_text(turn: Dict[str, Any]) -> str:
+    parts = turn.get("content") or []
+    chunks: List[str] = []
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") != "text":
+            continue
+        text_obj = part.get("text")
+        if isinstance(text_obj, dict):
+            s = text_obj.get("string")
+            if isinstance(s, str):
+                chunks.append(s)
+    return "\n".join(chunks).strip()
+
+
+def render_conversation(sample: Dict[str, Any]) -> None:
+    data = sample.get("data") or []
+    for turn in data:
+        if not isinstance(turn, dict):
+            continue
+        role = turn.get("role")
+        chat_role = "assistant"
+        if role == "user":
+            chat_role = "user"
+        text = extract_turn_text(turn)
+        with st.chat_message(chat_role):
+            st.markdown(text if text else "_(empty)_")
+
+
+def render_sample_card(sample: Dict[str, Any], tar_path: str, card_key: str) -> None:
+    sample_id = str(sample.get("id", "unknown"))
+    category = str(sample.get("category", "unknown"))
+    st.markdown(f"**ID**: `{sample_id}`  \n**Category**: `{category}`")
+
+    image_entries = extract_image_entries(sample)
+    img_count = len(image_entries)
+    st.caption(f"图片数量: {img_count}")
+
+    if img_count > 0:
+        idx_key = f"img_idx_{card_key}"
+        if idx_key not in st.session_state:
+            st.session_state[idx_key] = 0
+
+        c_prev, c_mid, c_next = st.columns([1, 4, 1])
+        with c_prev:
+            if st.button("◀", key=f"prev_{card_key}") and st.session_state[idx_key] > 0:
+                st.session_state[idx_key] -= 1
+        with c_next:
+            if (
+                st.button("▶", key=f"next_{card_key}")
+                and st.session_state[idx_key] < img_count - 1
+            ):
+                st.session_state[idx_key] += 1
+        with c_mid:
+            current_idx = int(st.session_state[idx_key])
+            st.caption(f"{current_idx + 1} / {img_count}")
+            image_obj = image_entries[current_idx]
+            rel = str(image_obj.get("relative_path", ""))
+            img_bytes = get_image_bytes_from_tar(tar_path, rel) if rel else None
+            if img_bytes:
+                # width controls display size while preserving aspect ratio.
+                st.image(io.BytesIO(img_bytes), width=420)
+            else:
+                st.warning(f"无法读取图像: {rel}")
+    else:
+        st.info("该样本无图像")
+
+    st.divider()
+    render_conversation(sample)
+
+    with st.expander("↙ 查看原始 JSON"):
+        st.json(sample)
+
+
+def load_sample_by_global_index(shards: List[Dict[str, Any]], global_index: int) -> Optional[Tuple[Dict[str, Any], str]]:
+    shard = find_shard_for_index(shards, global_index)
+    if shard is None:
+        return None
+    line_idx = global_index - int(shard["start_index"])
+    sample = get_row_from_jsonl(str(shard["jsonl_path"]), line_idx)
+    if sample is None:
+        return None
+    return sample, str(shard["tar_path"])
+
+
+def main() -> None:
+    st.set_page_config(page_title="Pangu ML 可视化", layout="wide")
+    st.title("Pangu ML 数据可视化")
+
+    root_input = st.text_input(
+        "输入 pangu_ml 数据根路径",
+        placeholder="例如: E:/data/pangu_ml_dataset",
+    )
+
+    if not root_input:
+        st.info("请输入数据根路径后开始浏览。")
+        return
+
+    shards = build_shard_index(root_input)
+    if not shards:
+        st.error("未找到有效分片。请确认目录下存在 `images/data_*.tar` 与 `jsonl/data_*.jsonl`。")
+        return
+
+    n = total_samples(shards)
+    st.success(f"已加载分片: {len(shards)}，总样本数: {n}")
+    if n == 0:
+        return
+
+    page_size = 2
+    total_pages = (n + page_size - 1) // page_size
+    page = int(st.number_input("页码", min_value=1, max_value=total_pages, value=1, step=1))
+    start = (page - 1) * page_size
+    indices = [start, start + 1]
+
+    left, right = st.columns(2)
+    for col, idx, slot in [(left, indices[0], "left"), (right, indices[1], "right")]:
+        with col:
+            if idx >= n:
+                st.info("本页无更多样本")
+                continue
+            loaded = load_sample_by_global_index(shards, idx)
+            if loaded is None:
+                st.error(f"样本加载失败: index={idx}")
+                continue
+            sample, tar_path = loaded
+            render_sample_card(sample, tar_path, card_key=f"{page}_{slot}_{idx}")
+
+
+if __name__ == "__main__":
+    main()
+
