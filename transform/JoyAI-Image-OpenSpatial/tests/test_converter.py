@@ -81,3 +81,29 @@ def test_readme_example_roundtrip(monkeypatch) -> None:
         assert extracted is not None
         assert extracted.read() == b"jpeg-bytes"
 
+
+def test_newline_is_preserved_in_converted_user_text(monkeypatch) -> None:
+    script_path = Path(__file__).resolve().parents[1] / "convert_to_pangu_ml.py"
+    spec = importlib.util.spec_from_file_location("joyai_convert_to_pangu_ml", script_path)
+    assert spec is not None and spec.loader is not None
+    conv = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(conv)  # type: ignore[attr-defined]
+
+    row = _example_row_from_readme()
+    row["conversations"][0]["value"] = "line1\nline2\n<image> line3"
+    category = conv.infer_subtask_from_row(row)
+
+    def _stub_convert_to_jpeg_and_get_size(_b: bytes):
+        return b"jpeg-bytes", 256, 192
+
+    monkeypatch.setattr(conv, "convert_to_jpeg_and_get_size", _stub_convert_to_jpeg_and_get_size)
+
+    tar_buf = io.BytesIO()
+    with tarfile.open(fileobj=tar_buf, mode="w") as tf:
+        sample = conv.build_pangu_sample(row=row, shard_tar=tf, row_index=0, category=category)
+
+    assert sample is not None
+    user_text = sample["data"][0]["content"][1]["text"]["string"]
+    assert "line1\nline2" in user_text
+    assert "<image>" not in user_text.lower()
+

@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import io
+import ast
 import json
+import math
 import tarfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -127,7 +129,206 @@ def extract_turn_text(turn: Dict[str, Any]) -> str:
             s = text_obj.get("string")
             if isinstance(s, str):
                 chunks.append(s)
-    return "\n".join(chunks).strip()
+    return "\n".join(chunks)
+
+
+def parse_camera_params_from_text(text: str) -> Optional[Dict[str, float]]:
+    import re
+
+    hfov_m = re.search(r"hfov\s*=\s*([0-9]+(?:\.[0-9]+)?)", text, flags=re.IGNORECASE)
+    vfov_m = re.search(r"vfov\s*=\s*([0-9]+(?:\.[0-9]+)?)", text, flags=re.IGNORECASE)
+    w_m = re.search(r"width\s*=\s*([0-9]+)", text, flags=re.IGNORECASE)
+    h_m = re.search(r"height\s*=\s*([0-9]+)", text, flags=re.IGNORECASE)
+    if not (hfov_m and vfov_m and w_m and h_m):
+        return None
+    return {
+        "hfov": float(hfov_m.group(1)),
+        "vfov": float(vfov_m.group(1)),
+        "width": float(w_m.group(1)),
+        "height": float(h_m.group(1)),
+    }
+
+
+def parse_grounding_boxes_from_text(text: str) -> List[Dict[str, Any]]:
+    parsed: Any
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        try:
+            parsed = ast.literal_eval(text)
+        except Exception:
+            return []
+    if isinstance(parsed, dict):
+        parsed = [parsed]
+    if not isinstance(parsed, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        bbox = item.get("bbox_3d")
+        if not isinstance(bbox, list) or len(bbox) < 9:
+            continue
+        try:
+            vals = [float(x) for x in bbox[:9]]
+        except Exception:
+            continue
+        out.append({"label": str(item.get("label") or "object"), "bbox_3d": vals})
+    return out
+
+
+def _matmul3(a: List[List[float]], b: List[List[float]]) -> List[List[float]]:
+    return [[sum(a[i][k] * b[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
+
+
+def _matvec3(a: List[List[float]], v: List[float]) -> List[float]:
+    return [sum(a[i][k] * v[k] for k in range(3)) for i in range(3)]
+
+
+def build_rotation_matrix_zxy(roll: float, pitch: float, yaw: float) -> List[List[float]]:
+    cx, sx = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    cz, sz = math.cos(roll), math.sin(roll)
+    rx = [[1.0, 0.0, 0.0], [0.0, cx, -sx], [0.0, sx, cx]]
+    ry = [[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]]
+    rz = [[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]]
+    return _matmul3(ry, _matmul3(rx, rz))
+
+
+def project_point_to_image(
+    xyz: List[float],
+    *,
+    hfov_deg: float,
+    vfov_deg: float,
+    width: float,
+    height: float,
+) -> Optional[Tuple[float, float]]:
+    x, y, z = xyz
+    if z <= 1e-6:
+        return None
+    fx = width / (2.0 * math.tan(math.radians(hfov_deg) / 2.0))
+    fy = height / (2.0 * math.tan(math.radians(vfov_deg) / 2.0))
+    cx = width / 2.0
+    cy = height / 2.0
+    u = fx * (x / z) + cx
+    v = fy * (y / z) + cy
+    if not (math.isfinite(u) and math.isfinite(v)):
+        return None
+    return float(u), float(v)
+
+
+def project_bbox_3d(
+    bbox_3d: List[float],
+    *,
+    hfov_deg: float,
+    vfov_deg: float,
+    width: float,
+    height: float,
+) -> List[Optional[Tuple[float, float]]]:
+    x_center, y_center, z_center, x_size, y_size, z_size, roll, pitch, yaw = bbox_3d
+    rot = build_rotation_matrix_zxy(roll, pitch, yaw)
+    hx, hy, hz = x_size / 2.0, y_size / 2.0, z_size / 2.0
+    local = [
+        [-hx, -hy, -hz],
+        [hx, -hy, -hz],
+        [hx, hy, -hz],
+        [-hx, hy, -hz],
+        [-hx, -hy, hz],
+        [hx, -hy, hz],
+        [hx, hy, hz],
+        [-hx, hy, hz],
+    ]
+    out: List[Optional[Tuple[float, float]]] = []
+    for p in local:
+        r = _matvec3(rot, p)
+        w = [r[0] + x_center, r[1] + y_center, r[2] + z_center]
+        out.append(
+            project_point_to_image(
+                w,
+                hfov_deg=hfov_deg,
+                vfov_deg=vfov_deg,
+                width=width,
+                height=height,
+            )
+        )
+    return out
+
+
+def maybe_get_grounding_overlay(sample: Dict[str, Any], image_idx: int) -> Optional[Dict[str, Any]]:
+    if image_idx != 0:
+        return None
+    data = sample.get("data") or []
+    if len(data) < 2:
+        return None
+    user_turn = data[0] if isinstance(data[0], dict) else {}
+    gpt_turn = data[1] if isinstance(data[1], dict) else {}
+    if user_turn.get("role") != "user" or gpt_turn.get("role") != "assistant":
+        return None
+    user_text = extract_turn_text(user_turn)
+    assistant_text = extract_turn_text(gpt_turn)
+    camera = parse_camera_params_from_text(user_text)
+    if camera is None:
+        return None
+    boxes = parse_grounding_boxes_from_text(assistant_text)
+    if not boxes:
+        return None
+
+    projected = []
+    for box in boxes:
+        corners = project_bbox_3d(
+            box["bbox_3d"],
+            hfov_deg=camera["hfov"],
+            vfov_deg=camera["vfov"],
+            width=camera["width"],
+            height=camera["height"],
+        )
+        projected.append({"label": box["label"], "corners": corners})
+    return {"camera": camera, "boxes": projected}
+
+
+def draw_grounding_3d_overlay(image_bytes: bytes, overlay: Dict[str, Any]) -> bytes:
+    from PIL import Image, ImageDraw
+
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    draw = ImageDraw.Draw(img)
+    w, h = img.size
+    cam = overlay["camera"]
+    sx = w / cam["width"] if cam["width"] > 0 else 1.0
+    sy = h / cam["height"] if cam["height"] > 0 else 1.0
+    edges = [
+        (0, 1),
+        (1, 2),
+        (2, 3),
+        (3, 0),
+        (4, 5),
+        (5, 6),
+        (6, 7),
+        (7, 4),
+        (0, 4),
+        (1, 5),
+        (2, 6),
+        (3, 7),
+    ]
+    colors = [(255, 77, 79), (24, 144, 255), (82, 196, 26), (250, 140, 22), (114, 46, 209)]
+    for idx, box in enumerate(overlay["boxes"]):
+        color = colors[idx % len(colors)]
+        corners = box["corners"]
+        for a, b in edges:
+            pa, pb = corners[a], corners[b]
+            if pa is None or pb is None:
+                continue
+            x1, y1 = pa[0] * sx, pa[1] * sy
+            x2, y2 = pb[0] * sx, pb[1] * sy
+            draw.line((x1, y1, x2, y2), fill=color, width=3)
+        anchor = next((p for p in corners if p is not None), None)
+        if anchor is not None:
+            lx = max(4.0, min(w - 4.0, anchor[0] * sx + 4.0))
+            ly = max(14.0, min(h - 4.0, anchor[1] * sy - 4.0))
+            draw.text((lx, ly), str(box["label"]), fill=color)
+
+    out = io.BytesIO()
+    img.save(out, format="PNG")
+    return out.getvalue()
 
 
 def render_conversation(sample: Dict[str, Any]) -> None:
@@ -141,7 +342,10 @@ def render_conversation(sample: Dict[str, Any]) -> None:
             chat_role = "user"
         text = extract_turn_text(turn)
         with st.chat_message(chat_role):
-            st.markdown(text if text else "_(empty)_")
+            if text:
+                st.text(text)
+            else:
+                st.markdown("_(empty)_")
 
 
 def render_sample_card(sample: Dict[str, Any], tar_path: str, card_key: str) -> None:
@@ -175,6 +379,9 @@ def render_sample_card(sample: Dict[str, Any], tar_path: str, card_key: str) -> 
             rel = str(image_obj.get("relative_path", ""))
             img_bytes = get_image_bytes_from_tar(tar_path, rel) if rel else None
             if img_bytes:
+                overlay = maybe_get_grounding_overlay(sample, current_idx)
+                if overlay is not None:
+                    img_bytes = draw_grounding_3d_overlay(img_bytes, overlay)
                 # width controls display size while preserving aspect ratio.
                 st.image(io.BytesIO(img_bytes), width=420)
             else:

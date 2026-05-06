@@ -298,8 +298,14 @@ def load_image_bytes(image_obj: Dict[str, Any]) -> Optional[bytes]:
 
 
 def strip_image_placeholder_tokens(text: str) -> str:
+    # Keep original line breaks for downstream visualization.
+    # We only remove the <image> placeholder and normalize spaces per line.
     text = IMAGE_TOKEN_RE.sub(" ", text)
-    return WHITESPACE_RE.sub(" ", text).strip()
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    normalized_lines = []
+    for line in text.split("\n"):
+        normalized_lines.append(re.sub(r"[ \t\f\v]+", " ", line).strip())
+    return "\n".join(normalized_lines).strip()
 
 
 def convert_to_jpeg_and_get_size(image_bytes: bytes) -> Tuple[bytes, int, int]:
