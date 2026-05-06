@@ -373,6 +373,29 @@ def draw_grounding_3d_overlay(image_bytes: bytes, overlay: Dict[str, Any]) -> by
         (3, 7),
     ]
     colors = [(255, 77, 79), (24, 144, 255), (82, 196, 26), (250, 140, 22), (114, 46, 209)]
+
+    def _place_text_fully_visible(x: float, y: float, text: str) -> Tuple[float, float]:
+        # Keep the whole text bbox inside the image (not just the anchor point).
+        pad = 2.0
+        x = max(pad, min(w - pad, x))
+        y = max(pad, min(h - pad, y))
+        try:
+            x0, y0, x1, y1 = draw.textbbox((x, y), text)
+            dx = 0.0
+            dy = 0.0
+            if x1 > w - pad:
+                dx -= x1 - (w - pad)
+            if x0 < pad:
+                dx += pad - x0
+            if y1 > h - pad:
+                dy -= y1 - (h - pad)
+            if y0 < pad:
+                dy += pad - y0
+            return x + dx, y + dy
+        except Exception:
+            # Fallback for older Pillow: best-effort clamp.
+            return x, y
+
     for idx, box in enumerate(overlay["boxes"]):
         color = colors[idx % len(colors)]
         corners_3d = bbox_3d_corners_camera(box["bbox_3d"])
@@ -408,9 +431,9 @@ def draw_grounding_3d_overlay(image_bytes: bytes, overlay: Dict[str, Any]) -> by
             if center_pt is not None:
                 label_xy = (center_pt[0] * sx, center_pt[1] * sy)
         if label_xy is not None:
-            lx = max(4.0, min(w - 4.0, label_xy[0] + 4.0))
-            ly = max(14.0, min(h - 4.0, label_xy[1] - 4.0))
-            draw.text((lx, ly), str(box["label"]), fill=color)
+            raw_label = str(box["label"])
+            lx, ly = _place_text_fully_visible(label_xy[0] + 4.0, label_xy[1] - 12.0, raw_label)
+            draw.text((lx, ly), raw_label, fill=color)
 
     out = io.BytesIO()
     img.save(out, format="PNG")
