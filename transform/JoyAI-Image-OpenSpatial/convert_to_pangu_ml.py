@@ -5,12 +5,22 @@ import io
 import json
 import re
 import tarfile
+from concurrent.futures import ProcessPoolExecutor
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pyarrow.parquet as pq
+
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover
+    tqdm = None  # type: ignore[misc, assignment]
+
+
+# Disambiguate synthetic sample ids when row id is missing (multi-file parallel).
+_INDEX_STRIDE = 1_000_000_000
 
 
 DATASET_NAME = "jdopensource/JoyAI-Image-OpenSpatial"
@@ -63,6 +73,17 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=256,
         help="Parquet batch size for streaming reads.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=16,
+        help="Parallel parquet files (process pool). Use 1 to disable parallelism.",
+    )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable tqdm progress (written samples).",
     )
     return parser.parse_args()
 
@@ -339,12 +360,12 @@ def to_text_content(text: str) -> Dict[str, Any]:
     }
 
 
-def build_pangu_sample(
+def build_pangu_sample_parts(
     row: Dict[str, Any],
-    shard_tar: tarfile.TarFile,
     row_index: int,
-    category: str,
-) -> Optional[Dict[str, Any]]:
+    category: Optional[str],
+) -> Optional[Tuple[Dict[str, Any], List[Tuple[str, bytes]]]]:
+    """Build JSON sample and tar member payloads (single-thread / worker-safe)."""
     sample_id = make_sample_id(row, row_index)
     conversations = normalize_scalar(row.get("conversations")) or []
     images = normalize_scalar(row.get("images")) or []
@@ -373,6 +394,7 @@ def build_pangu_sample(
         turns.append({"role": role, "text": text_value})
 
     first_user_content: List[Dict[str, Any]] = []
+    tar_members: List[Tuple[str, bytes]] = []
     for img_idx, image_obj in enumerate(images):
         image_obj = normalize_scalar(image_obj)
         if not isinstance(image_obj, dict):
@@ -382,10 +404,7 @@ def build_pangu_sample(
             continue
         image_bytes, width, height = convert_to_jpeg_and_get_size(source_image_bytes)
         tar_relative_path = build_tar_relative_path(sample_id, img_idx)
-
-        tar_info = tarfile.TarInfo(name=tar_relative_path)
-        tar_info.size = len(image_bytes)
-        shard_tar.addfile(tarinfo=tar_info, fileobj=io.BytesIO(image_bytes))
+        tar_members.append((tar_relative_path, image_bytes))
 
         first_user_content.append(
             {
@@ -411,29 +430,115 @@ def build_pangu_sample(
         content.append(to_text_content(text_value))
         data.append({"role": turn["role"], "content": content})
 
-    return {"meta_prompt": [""], "data": data, "id": sample_id, "category": category}
+    sample = {"meta_prompt": [""], "data": data, "id": sample_id, "category": category}
+    return sample, tar_members
+
+
+def build_pangu_sample(
+    row: Dict[str, Any],
+    shard_tar: tarfile.TarFile,
+    row_index: int,
+    category: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    parts = build_pangu_sample_parts(row, row_index, category)
+    if parts is None:
+        return None
+    sample, tar_members = parts
+    for tar_relative_path, image_bytes in tar_members:
+        tar_info = tarfile.TarInfo(name=tar_relative_path)
+        tar_info.size = len(image_bytes)
+        shard_tar.addfile(tarinfo=tar_info, fileobj=io.BytesIO(image_bytes))
+    return sample
+
+
+def iter_parquet_rows_single_file(
+    parquet_file: Path,
+    batch_size: int,
+    max_rows: Optional[int],
+) -> Iterable[Dict[str, Any]]:
+    yielded = 0
+    pf = pq.ParquetFile(parquet_file)
+    for batch in pf.iter_batches(batch_size=batch_size):
+        column_names = list(batch.schema.names)
+        columns = [batch.column(i) for i in range(batch.num_columns)]
+        for row_idx in range(batch.num_rows):
+            if max_rows is not None and yielded >= max_rows:
+                return
+            row: Dict[str, Any] = {}
+            for name, column in zip(column_names, columns):
+                value = column[row_idx]
+                row[name] = value.as_py() if hasattr(value, "as_py") else value
+            yield row
+            yielded += 1
 
 
 def iter_parquet_rows(parquet_files: Iterable[Path], batch_size: int) -> Iterable[Dict[str, Any]]:
     for parquet_file in parquet_files:
-        pf = pq.ParquetFile(parquet_file)
-        for batch in pf.iter_batches(batch_size=batch_size):
-            column_names = list(batch.schema.names)
-            columns = [batch.column(i) for i in range(batch.num_columns)]
-            for row_idx in range(batch.num_rows):
-                row: Dict[str, Any] = {}
-                for name, column in zip(column_names, columns):
-                    value = column[row_idx]
-                    row[name] = value.as_py() if hasattr(value, "as_py") else value
-                yield row
+        yield from iter_parquet_rows_single_file(parquet_file, batch_size, None)
 
 
-def count_dataset_rows(parquet_files: Iterable[Path]) -> int:
-    total = 0
-    for parquet_file in parquet_files:
-        pf = pq.ParquetFile(parquet_file)
-        total += pf.metadata.num_rows
-    return total
+def build_parquet_tasks(
+    parquet_files: List[Path],
+    batch_size: int,
+    max_samples: Optional[int],
+) -> List[Tuple[int, str, int, Optional[int]]]:
+    """One task per file; max_rows truncates tail when max_samples is set."""
+    tasks: List[Tuple[int, str, int, Optional[int]]] = []
+    remaining: Optional[int] = max_samples
+    for fi, path in enumerate(parquet_files):
+        file_rows = pq.ParquetFile(path).metadata.num_rows
+        if max_samples is None:
+            tasks.append((fi, str(path), batch_size, None))
+            continue
+        assert remaining is not None
+        if remaining <= 0:
+            break
+        take = min(file_rows, remaining)
+        tasks.append((fi, str(path), batch_size, take))
+        remaining -= take
+    return tasks
+
+
+def _process_parquet_file_task(
+    args: Tuple[int, str, int, Optional[int]],
+) -> Dict[str, Any]:
+    """Worker: process one parquet file (linear scan). Must be top-level for multiprocessing."""
+    file_idx, path_str, batch_size, max_rows = args
+    path = Path(path_str)
+    category_field: Optional[str] = None
+    category_counter: Counter = Counter()
+    data_source_counter: Counter = Counter()
+    total_seen = 0
+    skipped = 0
+    converted_records: List[Tuple[Dict[str, Any], List[Tuple[str, bytes]]]] = []
+    base_index = file_idx * _INDEX_STRIDE
+
+    for local_idx, row in enumerate(iter_parquet_rows_single_file(path, batch_size, max_rows)):
+        total_seen += 1
+        data_source = str(normalize_scalar(row.get("data_source") or "unknown_source"))
+        data_source_counter[data_source] += 1
+
+        cf, cv = extract_category(row)
+        if cv:
+            if category_field is None:
+                category_field = cf or "inferred_subtask_from_prompt"
+            category_counter[cv] += 1
+
+        parts = build_pangu_sample_parts(row, base_index + local_idx, cv)
+        if parts is None:
+            skipped += 1
+            continue
+        converted_records.append(parts)
+
+    return {
+        "file_idx": file_idx,
+        "total_seen": total_seen,
+        "skipped": skipped,
+        "converted_records": converted_records,
+        "category_counter": dict(category_counter),
+        "data_source_counter": dict(data_source_counter),
+        "category_field": category_field,
+    }
 
 
 def create_shard_handles(output_root: Path, shard_id: int):
@@ -469,7 +574,9 @@ def main() -> None:
 
     output_root = args.output_root
     output_root.mkdir(parents=True, exist_ok=True)
-    dataset_total_samples = count_dataset_rows(parquet_files)
+
+    tasks = build_parquet_tasks(parquet_files, args.batch_size, args.max_samples)
+    total_parquet_rows = sum(pq.ParquetFile(p).metadata.num_rows for p in parquet_files)
 
     stats = ConvertStats()
     category_counter: Counter = Counter()
@@ -479,44 +586,57 @@ def main() -> None:
     shard_written = 0
     shard_tar, shard_jsonl = create_shard_handles(output_root, shard_id)
 
+    use_pbar = tqdm is not None and not args.no_progress
+    pbar = tqdm(desc="Written samples", unit="sample", smoothing=0.05) if use_pbar else None
+
+    workers_eff = max(1, args.workers)
+
     try:
-        for global_idx, row in enumerate(iter_parquet_rows(parquet_files, args.batch_size)):
-            if args.max_samples is not None and stats.total_seen >= args.max_samples:
-                break
+        if not tasks:
+            results: List[Dict[str, Any]] = []
+        elif workers_eff == 1:
+            results = [_process_parquet_file_task(t) for t in tasks]
+        else:
+            max_w = min(workers_eff, len(tasks))
+            with ProcessPoolExecutor(max_workers=max_w) as ex:
+                results = list(ex.map(_process_parquet_file_task, tasks))
 
-            stats.total_seen += 1
-            data_source = str(normalize_scalar(row.get("data_source") or "unknown_source"))
-            data_source_counter[data_source] += 1
+        for res in results:
+            stats.total_seen += res["total_seen"]
+            stats.skipped += res["skipped"]
+            category_counter.update(res["category_counter"])
+            data_source_counter.update(res["data_source_counter"])
+            if stats.category_field is None and res["category_field"]:
+                stats.category_field = res["category_field"]
 
-            category_field, category_value = extract_category(row)
-            if category_value:
-                if stats.category_field is None:
-                    stats.category_field = category_field or "inferred_subtask_from_prompt"
-                category_counter[category_value] += 1
-
-            converted = build_pangu_sample(
-                row=row,
-                shard_tar=shard_tar,
-                row_index=global_idx,
-                category=category_value,
-            )
-            if converted is None:
-                stats.skipped += 1
-                continue
-
-            shard_jsonl.write(json.dumps(converted, ensure_ascii=False) + "\n")
-            stats.converted += 1
-            shard_written += 1
-
-            if shard_written >= args.shard_size:
-                shard_tar.close()
-                shard_jsonl.close()
-                shard_id += 1
-                shard_written = 0
-                shard_tar, shard_jsonl = create_shard_handles(output_root, shard_id)
+        for res in results:
+            for sample_dict, tar_members in res["converted_records"]:
+                for tar_relative_path, image_bytes in tar_members:
+                    tar_info = tarfile.TarInfo(name=tar_relative_path)
+                    tar_info.size = len(image_bytes)
+                    shard_tar.addfile(tarinfo=tar_info, fileobj=io.BytesIO(image_bytes))
+                shard_jsonl.write(json.dumps(sample_dict, ensure_ascii=False) + "\n")
+                stats.converted += 1
+                shard_written += 1
+                if pbar is not None:
+                    pbar.update(1)
+                if shard_written >= args.shard_size:
+                    shard_tar.close()
+                    shard_jsonl.close()
+                    shard_id += 1
+                    shard_written = 0
+                    shard_tar, shard_jsonl = create_shard_handles(output_root, shard_id)
     finally:
         shard_tar.close()
         shard_jsonl.close()
+        if pbar is not None:
+            pbar.close()
+
+    stopped_by_max_samples = (
+        args.max_samples is not None
+        and stats.total_seen >= args.max_samples
+        and total_parquet_rows > args.max_samples
+    )
 
     if stats.total_seen == 0:
         category_distribution = {}
@@ -539,11 +659,20 @@ def main() -> None:
             for k, v in data_source_counter.items()
         }
 
+    # Full parquet row count: only known after a complete scan (no early cap break).
+    # Avoids a separate pre-pass over all parquet metadata for small-batch runs.
+    dataset_total_samples: Optional[int] = (
+        None if stopped_by_max_samples else stats.total_seen
+    )
+
     metadata = {
         "dataset_name": DATASET_NAME,
         "input_parquet_dir": str(parquet_dir),
         "output_root": str(output_root),
+        "workers": workers_eff,
+        "parquet_files_scheduled": len(tasks),
         "dataset_total_samples": dataset_total_samples,
+        "stopped_by_max_samples": stopped_by_max_samples,
         "requested_max_samples": args.max_samples,
         "id_strategy": "source_plus_id",
         "image_placeholder_policy": "always_strip",
@@ -561,8 +690,16 @@ def main() -> None:
     metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print("=== Conversion Summary ===")
+    print(f"workers: {workers_eff}  parquet_tasks: {len(tasks)}")
     print(f"dataset_name: {metadata['dataset_name']}")
-    print(f"dataset_total_samples: {metadata['dataset_total_samples']}")
+    dts = metadata["dataset_total_samples"]
+    if dts is None:
+        print(
+            "dataset_total_samples: <unknown — run ended early due to --max-samples; "
+            "see total_samples_seen for rows scanned in this run>"
+        )
+    else:
+        print(f"dataset_total_samples: {dts}")
     print(f"total_samples_seen: {metadata['total_samples_seen']}")
     print(f"converted_samples: {metadata['converted_samples']}")
     print(f"skipped_samples: {metadata['skipped_samples']}")

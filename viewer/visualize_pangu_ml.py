@@ -66,6 +66,28 @@ def total_samples(shards: List[Dict[str, Any]]) -> int:
     return sum(int(s["line_count"]) for s in shards)
 
 
+@st.cache_data(show_spinner=False)
+def build_category_index(root_path: str) -> Dict[str, List[int]]:
+    """Scan jsonl shards once; map category string (empty string if missing/null) -> global indices."""
+    shards = build_shard_index(root_path)
+    cat_map: Dict[str, List[int]] = {}
+    for shard in shards:
+        start = int(shard["start_index"])
+        path = Path(shard["jsonl_path"])
+        with path.open("r", encoding="utf-8") as f:
+            for line_idx, line in enumerate(f):
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                raw = obj.get("category")
+                cat = "" if raw is None else str(raw)
+                if cat not in cat_map:
+                    cat_map[cat] = []
+                cat_map[cat].append(start + line_idx)
+    return cat_map
+
+
 def find_shard_for_index(shards: List[Dict[str, Any]], index: int) -> Optional[Dict[str, Any]]:
     for shard in shards:
         if int(shard["start_index"]) <= index <= int(shard["end_index"]):
@@ -195,6 +217,34 @@ def build_rotation_matrix_zxy(roll: float, pitch: float, yaw: float) -> List[Lis
     return _matmul3(ry, _matmul3(rx, rz))
 
 
+def bbox_3d_corners_camera(bbox_3d: List[float]) -> List[Tuple[float, float, float]]:
+    """Eight box corners in camera space (before projection)."""
+    x_center, y_center, z_center, x_size, y_size, z_size, roll, pitch, yaw = bbox_3d
+    rot = build_rotation_matrix_zxy(roll, pitch, yaw)
+    hx, hy, hz = x_size / 2.0, y_size / 2.0, z_size / 2.0
+    local = [
+        [-hx, -hy, -hz],
+        [hx, -hy, -hz],
+        [hx, hy, -hz],
+        [-hx, hy, -hz],
+        [-hx, -hy, hz],
+        [hx, -hy, hz],
+        [hx, hy, hz],
+        [-hx, hy, hz],
+    ]
+    out: List[Tuple[float, float, float]] = []
+    for p in local:
+        r = _matvec3(rot, p)
+        out.append(
+            (
+                r[0] + x_center,
+                r[1] + y_center,
+                r[2] + z_center,
+            )
+        )
+    return out
+
+
 def project_point_to_image(
     xyz: List[float],
     *,
@@ -217,6 +267,30 @@ def project_point_to_image(
     return float(u), float(v)
 
 
+def _clip_segment_to_z_min(
+    p0: Tuple[float, float, float],
+    p1: Tuple[float, float, float],
+    z_min: float,
+) -> Optional[Tuple[Tuple[float, float, float], Tuple[float, float, float]]]:
+    """Clip segment to the half-space z >= z_min. Returns None if fully behind the plane."""
+    x0, y0, z0 = p0
+    x1, y1, z1 = p1
+    if z0 >= z_min and z1 >= z_min:
+        return p0, p1
+    if z0 < z_min and z1 < z_min:
+        return None
+    dz = z1 - z0
+    if abs(dz) < 1e-12:
+        return None
+    if z0 < z_min:
+        t = (z_min - z0) / dz
+        q0 = (x0 + t * (x1 - x0), y0 + t * (y1 - y0), z_min)
+        return q0, p1
+    t = (z_min - z1) / (-dz)
+    q1 = (x1 + t * (x0 - x1), y1 + t * (y0 - y1), z_min)
+    return p0, q1
+
+
 def project_bbox_3d(
     bbox_3d: List[float],
     *,
@@ -225,26 +299,11 @@ def project_bbox_3d(
     width: float,
     height: float,
 ) -> List[Optional[Tuple[float, float]]]:
-    x_center, y_center, z_center, x_size, y_size, z_size, roll, pitch, yaw = bbox_3d
-    rot = build_rotation_matrix_zxy(roll, pitch, yaw)
-    hx, hy, hz = x_size / 2.0, y_size / 2.0, z_size / 2.0
-    local = [
-        [-hx, -hy, -hz],
-        [hx, -hy, -hz],
-        [hx, hy, -hz],
-        [-hx, hy, -hz],
-        [-hx, -hy, hz],
-        [hx, -hy, hz],
-        [hx, hy, hz],
-        [-hx, hy, hz],
-    ]
     out: List[Optional[Tuple[float, float]]] = []
-    for p in local:
-        r = _matvec3(rot, p)
-        w = [r[0] + x_center, r[1] + y_center, r[2] + z_center]
+    for w in bbox_3d_corners_camera(bbox_3d):
         out.append(
             project_point_to_image(
-                w,
+                list(w),
                 hfov_deg=hfov_deg,
                 vfov_deg=vfov_deg,
                 width=width,
@@ -282,7 +341,9 @@ def maybe_get_grounding_overlay(sample: Dict[str, Any], image_idx: int) -> Optio
             width=camera["width"],
             height=camera["height"],
         )
-        projected.append({"label": box["label"], "corners": corners})
+        projected.append(
+            {"label": box["label"], "bbox_3d": box["bbox_3d"], "corners": corners}
+        )
     return {"camera": camera, "boxes": projected}
 
 
@@ -295,6 +356,8 @@ def draw_grounding_3d_overlay(image_bytes: bytes, overlay: Dict[str, Any]) -> by
     cam = overlay["camera"]
     sx = w / cam["width"] if cam["width"] > 0 else 1.0
     sy = h / cam["height"] if cam["height"] > 0 else 1.0
+    hfov, vfov, cw, ch = cam["hfov"], cam["vfov"], cam["width"], cam["height"]
+    z_clip = 1e-4
     edges = [
         (0, 1),
         (1, 2),
@@ -312,18 +375,41 @@ def draw_grounding_3d_overlay(image_bytes: bytes, overlay: Dict[str, Any]) -> by
     colors = [(255, 77, 79), (24, 144, 255), (82, 196, 26), (250, 140, 22), (114, 46, 209)]
     for idx, box in enumerate(overlay["boxes"]):
         color = colors[idx % len(colors)]
-        corners = box["corners"]
+        corners_3d = bbox_3d_corners_camera(box["bbox_3d"])
+        label_xy: Optional[Tuple[float, float]] = None
         for a, b in edges:
-            pa, pb = corners[a], corners[b]
+            clipped = _clip_segment_to_z_min(corners_3d[a], corners_3d[b], z_clip)
+            if clipped is None:
+                continue
+            q0, q1 = clipped
+            pa = project_point_to_image(
+                list(q0), hfov_deg=hfov, vfov_deg=vfov, width=cw, height=ch
+            )
+            pb = project_point_to_image(
+                list(q1), hfov_deg=hfov, vfov_deg=vfov, width=cw, height=ch
+            )
             if pa is None or pb is None:
                 continue
             x1, y1 = pa[0] * sx, pa[1] * sy
             x2, y2 = pb[0] * sx, pb[1] * sy
             draw.line((x1, y1, x2, y2), fill=color, width=3)
-        anchor = next((p for p in corners if p is not None), None)
-        if anchor is not None:
-            lx = max(4.0, min(w - 4.0, anchor[0] * sx + 4.0))
-            ly = max(14.0, min(h - 4.0, anchor[1] * sy - 4.0))
+            if label_xy is None:
+                label_xy = ((x1 + x2) * 0.5, (y1 + y2) * 0.5)
+        if label_xy is None:
+            bbox = box["bbox_3d"]
+            cz = max(float(bbox[2]), z_clip)
+            center_pt = project_point_to_image(
+                [float(bbox[0]), float(bbox[1]), cz],
+                hfov_deg=hfov,
+                vfov_deg=vfov,
+                width=cw,
+                height=ch,
+            )
+            if center_pt is not None:
+                label_xy = (center_pt[0] * sx, center_pt[1] * sy)
+        if label_xy is not None:
+            lx = max(4.0, min(w - 4.0, label_xy[0] + 4.0))
+            ly = max(14.0, min(h - 4.0, label_xy[1] - 4.0))
             draw.text((lx, ly), str(box["label"]), fill=color)
 
     out = io.BytesIO()
@@ -430,16 +516,33 @@ def main() -> None:
     if n == 0:
         return
 
+    cat_map = build_category_index(root_input)
+    cat_options: List[str] = ["(全部)"]
+    if "" in cat_map:
+        cat_options.append("(未标注)")
+    cat_options.extend(sorted(k for k in cat_map.keys() if k != ""))
+    category_filter = st.selectbox("按 category 筛选", cat_options, index=0)
+    if category_filter == "(全部)":
+        view_indices = list(range(n))
+    elif category_filter == "(未标注)":
+        view_indices = cat_map.get("", [])
+    else:
+        view_indices = cat_map.get(category_filter, [])
+
+    n_view = len(view_indices)
+    st.caption(f"当前筛选下样本数: {n_view}")
+
     page_size = 2
-    total_pages = (n + page_size - 1) // page_size
+    total_pages = max(1, (n_view + page_size - 1) // page_size) if n_view > 0 else 1
     page = int(st.number_input("页码", min_value=1, max_value=total_pages, value=1, step=1))
     start = (page - 1) * page_size
-    indices = [start, start + 1]
+    slot_a = view_indices[start] if start < n_view else None
+    slot_b = view_indices[start + 1] if start + 1 < n_view else None
 
     left, right = st.columns(2)
-    for col, idx, slot in [(left, indices[0], "left"), (right, indices[1], "right")]:
+    for col, idx, slot in [(left, slot_a, "left"), (right, slot_b, "right")]:
         with col:
-            if idx >= n:
+            if idx is None:
                 st.info("本页无更多样本")
                 continue
             loaded = load_sample_by_global_index(shards, idx)

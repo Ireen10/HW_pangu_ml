@@ -197,7 +197,7 @@ python transform/JoyAI-Image-OpenSpatial/convert_to_pangu_ml.py \
 `metadata.json` 会包含：
 
 - 数据集名
-- parquet 元信息统计出的 `dataset_total_samples`
+- `dataset_total_samples`：本次跑完整个 parquet 迭代后的总行数（与主循环统计一致）；若因 `--max-samples` 提前结束则为 `null`，并带 `stopped_by_max_samples: true`
 - 实际扫描量/成功转换量/跳过量
 - 各 `data_source` 的样本量与占比
 - 是否检测到 category、各 category 的样本量与占比（若存在）
