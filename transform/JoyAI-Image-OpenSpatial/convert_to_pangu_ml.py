@@ -5,7 +5,7 @@ import io
 import json
 import re
 import tarfile
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -486,13 +486,14 @@ def build_parquet_tasks(
     tasks: List[Tuple[int, str, int, Optional[int]]] = []
     remaining: Optional[int] = max_samples
     for fi, path in enumerate(parquet_files):
-        file_rows = pq.ParquetFile(path).metadata.num_rows
         if max_samples is None:
             tasks.append((fi, str(path), batch_size, None))
             continue
         assert remaining is not None
         if remaining <= 0:
             break
+        # For capped runs only, read parquet metadata to avoid scanning too many rows.
+        file_rows = pq.ParquetFile(path).metadata.num_rows
         take = min(file_rows, remaining)
         tasks.append((fi, str(path), batch_size, take))
         remaining -= take
@@ -576,7 +577,13 @@ def main() -> None:
     output_root.mkdir(parents=True, exist_ok=True)
 
     tasks = build_parquet_tasks(parquet_files, args.batch_size, args.max_samples)
-    total_parquet_rows = sum(pq.ParquetFile(p).metadata.num_rows for p in parquet_files)
+    # Scanning metadata for thousands of small parquet files can be slower than the conversion itself.
+    # Only compute this value when we need it for the --max-samples early-stop flag.
+    total_parquet_rows: Optional[int] = (
+        sum(pq.ParquetFile(p).metadata.num_rows for p in parquet_files)
+        if args.max_samples is not None
+        else None
+    )
 
     stats = ConvertStats()
     category_counter: Counter = Counter()
@@ -587,29 +594,26 @@ def main() -> None:
     shard_tar, shard_jsonl = create_shard_handles(output_root, shard_id)
 
     use_pbar = tqdm is not None and not args.no_progress
-    pbar = tqdm(desc="Written samples", unit="sample", smoothing=0.05) if use_pbar else None
+    # Progress is by successful writes; with --max-samples we can cap total for a useful ETA.
+    pbar_total = args.max_samples if args.max_samples is not None else None
+    pbar = (
+        tqdm(total=pbar_total, desc="Written samples", unit="sample", smoothing=0.05)
+        if use_pbar
+        else None
+    )
 
     workers_eff = max(1, args.workers)
 
     try:
-        if not tasks:
-            results: List[Dict[str, Any]] = []
-        elif workers_eff == 1:
-            results = [_process_parquet_file_task(t) for t in tasks]
-        else:
-            max_w = min(workers_eff, len(tasks))
-            with ProcessPoolExecutor(max_workers=max_w) as ex:
-                results = list(ex.map(_process_parquet_file_task, tasks))
-
-        for res in results:
-            stats.total_seen += res["total_seen"]
-            stats.skipped += res["skipped"]
+        def _write_one_file_result(res: Dict[str, Any]) -> None:
+            nonlocal shard_id, shard_written, shard_tar, shard_jsonl
+            stats.total_seen += int(res["total_seen"])
+            stats.skipped += int(res["skipped"])
             category_counter.update(res["category_counter"])
             data_source_counter.update(res["data_source_counter"])
-            if stats.category_field is None and res["category_field"]:
+            if stats.category_field is None and res.get("category_field"):
                 stats.category_field = res["category_field"]
 
-        for res in results:
             for sample_dict, tar_members in res["converted_records"]:
                 for tar_relative_path, image_bytes in tar_members:
                     tar_info = tarfile.TarInfo(name=tar_relative_path)
@@ -626,16 +630,29 @@ def main() -> None:
                     shard_id += 1
                     shard_written = 0
                     shard_tar, shard_jsonl = create_shard_handles(output_root, shard_id)
+
+        if not tasks:
+            pass
+        elif workers_eff == 1:
+            for t in tasks:
+                _write_one_file_result(_process_parquet_file_task(t))
+        else:
+            max_w = min(workers_eff, len(tasks))
+            with ProcessPoolExecutor(max_workers=max_w) as ex:
+                futures = [ex.submit(_process_parquet_file_task, t) for t in tasks]
+                for fut in as_completed(futures):
+                    # Write as soon as a file finishes to keep progress moving.
+                    _write_one_file_result(fut.result())
     finally:
         shard_tar.close()
         shard_jsonl.close()
         if pbar is not None:
             pbar.close()
 
-    stopped_by_max_samples = (
+    stopped_by_max_samples = bool(
         args.max_samples is not None
         and stats.total_seen >= args.max_samples
-        and total_parquet_rows > args.max_samples
+        and (total_parquet_rows is not None and total_parquet_rows > args.max_samples)
     )
 
     if stats.total_seen == 0:
