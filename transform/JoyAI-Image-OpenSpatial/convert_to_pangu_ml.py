@@ -111,12 +111,290 @@ def normalize_question_text(text: Any) -> str:
     return raw.strip().lower()
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# OpenSpatial template-based subtask classifier.
+# Derived directly from task/prompt_templates/*.py in the OpenSpatial repo.
+#
+# Each rule: (task_label, is_multiview, [template_question_strings])
+#   is_multiview = True  → always "multi_view"
+#   is_multiview = False → always "single_view"
+#   is_multiview = None  → determined by img_count (template is view-neutral)
+#
+# Placeholders [A],[B],[T],... are compiled to .+  (via regex).
+# MCQ variants are omitted: re.search on base patterns matches them too.
+# ──────────────────────────────────────────────────────────────────────────
+_TEMPLATE_RULES: List[Tuple[str, Optional[bool], List[str]]] = [
+    # ── Correspondence (always multiview: cross-image point / object matching) ──
+    ("correspondence", True, [
+        # point2point — distinctive endings (templates use typographic quotes around
+        # labels, so we match by unique trailing phrases that have no encoding issues)
+        "which matches the original?",
+        "can you identify the corresponding point?",
+        # object2object
+        "Does the [A] in image 1 show up in image 2?",
+        "Can you find the [A] from image 1 in image 2?",
+        "Is the [A] from the first image visible in the second image?",
+        "Is the [A] in image 1 different from any object in image 2?",
+    ]),
+
+    # ── Multiview object position / direction ──────────────────────────────
+    ("position", True, [
+        # type1: direction of C from B, given A is [X] of B in image 1
+        "If the [A] is [X] of the [B] in image 1, what direction is the [C] (visible in image 2) from the [B]?",
+        "If the [A] is to the [X] of the [B] in the first image, what direction is the [C] from the [B]?",
+        "Given that the [A] appears [X] relative to the [B] in image 1, which direction does the [C] (seen in image 2) lie with respect to the [B]?",
+        "In image 1, if the [A] is located [X] of the [B], what direction does the [C] (depicted in image 2) take from the [B]?",
+        "If the [A] is positioned [X] relative to the [B] in the first image, how would you describe the direction of the [C] (visible in image 2) in relation to the [B]?",
+        "What direction does the [C] (shown in image 2) occupy from the [B], given that the [A] is [X] to the [B] in image 1?",
+        # type2: I am at B's position, A is on my [X] side, where is C (in image 2)?
+        "If I am at the position of the [B] in image 1, and the [A] is on the [X] side of me, what direction is the [C] (visible in image 2) from my position?",
+        "Standing at the location of the [B] in the first image, with the [A] is on my [X] side, which direction does the [C] (seen in image 2 ) lie from me?",
+        "From the viewpoint of the [B] in image 1, if the [A] is located at the [X] side of me, what direction does the [C] (depicted in image 2) take from my position?",
+        "If I consider myself at the [B]'s position in the first image, and the [A] is positioned at the [X] side of me, how would I describe the direction of the [C] (visible in image 2) from my location?",
+        "Assume I am at the [B]'s position in image 1, with the [A] on my [X] side, what direction does the [C] (shown in image 2) occupy from my viewpoint?",
+        "From the perspective of the [B] in the first image, if the [A] is on the [X] side of the [B], which direction is the [C] (visible in image 2) from the [B]'s position?",
+    ]),
+
+    # ── 3D scene caption (always single-view; task module dropout=0 ensures presence) ──
+    ("3d_scene_caption", False, [
+        "Create comprehensive spatial relationship descriptions that capture every observable detail in 100-200 words.",
+        "Generate systematic visual documentation focusing on spatial relationships of object positions in 100-200 words.",
+        "Develop detailed scene inventories that catalog all visible elements and their spatial relationships in 100-200 words.",
+        "Produce structured spatial layout analysis report containing both descriptive text and technical metadata in 100-200 words.",
+        "Construct thorough image assessments covering spatial, temporal, and contextual elements in 100-200 words.",
+    ]),
+
+    # ── Multiview distance: farthest / closest / object-camera (always multiview) ──
+    ("distance", True, [
+        # distance.farthest
+        "Given the multi-view images and objects: [T], which one is the farthest from the [X]?",
+        "Considering the multi-view images and the set of objects [T], which object is most distant from [X]?",
+        "From the provided multi-view images and objects [T], identify the object that is the farthest from [X].",
+        "Among the objects [T] shown in the multi-view images, which one has the greatest distance from [X]?",
+        "From the multi-view objects [T], identify the one farthest from [X].",
+        "Out of the objects [T] in the multi-view images, which one is the most distant from [X]?",
+        "If you view objects [T] from multiple perspectives, which one has the maximum distance to [X]?",
+        # distance.closest
+        "Given the multi-view images and objects: [T], which one is the closest to the [X]?",
+        "Considering the multi-view images and the set of objects [T], which object is nearest to [X]?",
+        "From the provided multi-view images and objects [T], identify the object that is the closest to [X].",
+        "Among the objects [T] shown in the multi-view images, which one has the smallest distance from [X]?",
+        "From the multi-view objects [T], identify the one closest to [X].",
+        "Out of the objects [T] in the multi-view images, which one is the nearest to [X]?",
+        "If you view objects [T] from multiple perspectives, which one has the minimum distance to [X]?",
+        # distance.obj_cam / distance.obj_cam_mcq
+        "View 1 and View 2 are two different views that represent the same scene. In which view the [A] in the scene is [Y] to the spot where the camera view was positioned?",
+        "Two views (View 1 and View 2) show the same scene from different angles. In which view is the [A] [Y] to the camera position?",
+        "Given View 1 and View 2 of the same scene, in which view does the [A] appear [Y] to where the camera was placed?",
+        "The same scene is captured in View 1 and View 2. In which view is the [A] [Y] to the camera viewpoint?",
+    ]),
+
+    # ── Multiview size: biggest / smallest / big / small (always multiview) ──
+    ("size", True, [
+        # size.biggest
+        "Given the multi-view images and the objects: [T], which one is the biggest?",
+        "Considering the set of objects: [T] in the multi-view images, identify the one with the largest size.",
+        "From the provided objects: [T] in different perspectives, which object has the greatest size?",
+        "Out of the objects: [T], which one is the largest in size?",
+        "From the collection of objects: [T] in different views, determine which is the biggest.",
+        # size.smallest
+        "Given the multi-view images and the objects: [T], which one is the smallest?",
+        "Considering the set of objects: [T] in the multi-view images, identify the one with the smallest size.",
+        "From the provided objects: [T] in different perspectives, which object has the least size?",
+        "Out of the objects: [T], which one is the smallest in size?",
+        "From the collection of objects: [T] in different views, determine which is the smallest.",
+        # size.big.multi_view
+        "Given two different views, Is the [A] bigger than the [B]?",
+        "As shown in different views, does the [A] have a larger size compared to the [B]?",
+        "After reviewing the images, can you confirm if the [A] is bigger than the [B]?",
+        # size.small.multi_view
+        "Based on the given images, is the [A] smaller than the [B]?",
+        "Considering the different perspectives of the scene, does the [A] have a smaller size compared to the [B]?",
+        "After reviewing the images, can you confirm if the [A] is smaller than the [B]?",
+    ]),
+
+    # ── 3D grounding (always single-view; camera preamble prepended to question) ──
+    ("grounding_3d", False, [
+        # object_grounding_box_template_questions (open-ended)
+        "Identify the 3D bounding box surrounding the [A] within this environment.",
+        "Locate the 3D bounding volume for the [A] present in the scene.",
+        "Find the 3D bounding box that encapsulates the [A] in this visual representation.",
+        "Extract the 3D bounding box coordinates of the [A] located in the image.",
+        "Outline the 3D bounding box for the [A] visible in this setting.",
+        "Pinpoint the 3D bounding box enclosing the [A] in this layout.",
+        "Trace the edges of the 3D bounding box around the [A] in this scenario.",
+        "Highlight the 3D bounding box that frames the [A] observed in the image.",
+        "Predict the 3D location of the [A] observed in the image.",
+        # camera_system_prompt terminal phrase (grounding_3d.camera_system template)
+        'Output a json list where each entry contains the object name in "label" and its 3D bounding box in "bbox_3d".',
+    ]),
+
+    # ── Depth (always single-view) ──────────────────────────────────────────
+    ("depth", False, [
+        # depth.ordering
+        "Given the [T] [A], please order them by depth (from near to far).",
+        "Please arrange the [T] [A] based on their depth (from near to far).",
+        "Order the [T] [A] according to their depth from near to far.",
+        "Sort the [T] [A] by depth (from near to far).",
+        "Can you organize the [T] [A] in order of their depth (from near to far)?",
+        "Please sequence the [T] [A] from shallowest to deepest .",
+        # depth.choice
+        "Between the [T] [A], which one is the [B] closest to the camera?",
+        "Among the [T] [A], which one is the [B] nearest to the camera?",
+        "From the [T] [A], identify the one that is the [B] closest to the camera.",
+        "Considering the [T] [A], which one is the [B] nearest to the camera?",
+        "Out of the [T] [A], which one has the [B] smallest depth?",
+        # depth.farthest
+        "Between the [T] [A], which one is the farthest from the camera?",
+        "Among the [T] [A], which one is the most distant from the camera?",
+        "From the [T] [A], identify the one that is the farthest from the camera.",
+        "Considering the [T] [A], which one is the most distant from the camera?",
+        "Out of the [T] [A], which one has the greatest depth?",
+        "From the [T] [A], which is the one with the largest depth?",
+        # depth.closest
+        "Between the [T] [A], which one is the closest to the camera?",
+        "Among the [T] [A], which one is the nearest to the camera?",
+        "From the [T] [A], identify the one that is the closest to the camera.",
+        "Considering the [T] [A], which one is the nearest to the camera?",
+        "Out of the [T] [A], which one has the smallest depth?",
+        "From the [T] [A], which one is the one with the least depth?",
+    ]),
+
+    # ── Counting (always single-view) ──────────────────────────────────────
+    ("counting", False, [
+        "Find out how many [A](s) in this scene.",
+        "What is the number of the [A](s)?",
+        "How many [A](s) are there?",
+        "Could you tell me the number of the [A](s)?",
+        "Counting the number of [A](s) in this scene?",
+        "How many [A](s) can you see?",
+        "How many [A](s) are present?",
+        "What is the count of the [A](s)?",
+        "Can you provide the count of the [A]?",
+        "Please count the number of [A].",
+    ]),
+
+    # ── Single-view size (absolute / height / relative big / small) ──────────
+    ("size", False, [
+        # size.absolute.single_view
+        "What is the length of the dimension that is largest in size (length, width, or height) of the [A]? [D]",
+        "What is the measurement for the longest side (length, width, or height) of the [A]? [D]",
+        "Can you provide the size of the [A]'s largest dimension (length, width, or height)? [D]",
+        "What is the length of the dimension that is maximum (length, width, or height) of the [A]? [D]",
+        "What is the length of the dimension that is the greatest (length, width, or height) of the [A]? [D]",
+        "What is the measurement of the [A]'s longest dimension (length, width, or height)? [D]",
+        "Can you tell me the size of the [A]'s maximum dimension (length, width, or height)? [D]",
+        "What is the length of the dimension that is the most extensive (length, width, or height) of the [A]? [D]",
+        "What is the measurement of the [A]'s greatest dimension (length, width, or height)? [D]",
+        "Can you provide the size of the [A]'s most significant dimension (length, width, or height)? [D]",
+        # size.height.single_view
+        "Could you estimate the height of the [A]? [D]",
+        "What is the vertical measurement of the [A]? [D]",
+        "Can you provide the height dimension of the [A]? [D]",
+        "How tall does the [A] stand? [D]",
+        "What is the height of the [A]? [D]",
+        "Could you tell me the vertical size of the [A]? [D]",
+        "What is the measurement of the [A]'s height? [D]",
+        "Can you estimate how high the [A] is? [D]",
+        "What is the vertical dimension of the [A]? [D]",
+        # size.big.single_view
+        "Is the [A] bigger than the [B]?",
+        "Does the [A] have a larger size compared to the [B]?",
+        "Can you confirm if the [A] is bigger than the [B]?",
+        # size.small.single_view
+        "Is the [A] smaller than the [B]?",
+        "Does the [A] have a smaller size compared to the [B]?",
+        "Can you confirm if the [A] is smaller than the [B]?",
+    ]),
+
+    # ── Neutral distance (is_mv=None → use img_count) ──────────────────────
+    # distance.absolute_m / absolute_cm used by both singleview and multiview tasks
+    ("distance", None, [
+        "Measuring from the closest point of each object, what is the distance between the [A] and the [B] (in meters)?",
+        "Measuring from the closest point of each object, what is the distance between the [A] and the [B] (in centimeters)?",
+        "What is the distance between the [A] and the [B] (in meters)?",
+        "What is the distance between the [A] and the [B] (in centimeters)?",
+        "Consider the real-world 3D location of the objects. What is the distance between the [A] and the [B] (in meters)?",
+        "Consider the real-world 3D location of the objects. What is the distance between the [A] and the [B] (in centimeters)?",
+        # distance.relative_far
+        "Estimate the real-world distances between objects in this image. Which object is farther from the [C], the [A] or the [B]? [O]",
+        "Based on the spatial arrangement of objects in this image, which object is more distant from the [C], the [A] or the [B]? [O]",
+        "Considering the 3D positions of objects in this image, which one is farther from the [C], the [A] or the [B]? [O]",
+        "From the perspective of this image, which object is more distant from the [C], the [A] or the [B]? [O]",
+        "Looking at the spatial layout in this image, which object is farther from the [C], the [A] or the [B]? [O]",
+        "Which of [A] and [B] is farther to [C]? [O]",
+        # distance.relative_close
+        "Estimate the real-world distances between objects in this image. Which object is closer to the [C], the [A] or the [B]? [O]",
+        "Based on the spatial arrangement of objects in this image, which object is nearer to the [C], the [A] or the [B]? [O]",
+        "Considering the 3D positions of objects in this image, which one is closer to the [C], the [A] or the [B]? [O]",
+        "From the perspective of this image, which object is nearer to the [C], the [A] or the [B]? [O]",
+        "Looking at the spatial layout in this image, which object is closer to the [C], the [A] or the [B]? [O]",
+        "Which of [A] and [B] is closer to [C]? [O]",
+    ]),
+
+    # ── Single-view position: height higher/lower / near-far adjacency ───────
+    ("position", False, [
+        # position.height_higher
+        "Consider the real-world 3D locations of the objects. Which object has a higher location? [O]",
+        "Based on the 3D positions of the objects, which one is placed at a higher elevation? [O]",
+        "Looking at the real-world 3D arrangement, which object is positioned higher? [O]",
+        "Considering the spatial positions of the objects in 3D space, which one sits higher? [O]",
+        # position.height_lower
+        "Consider the real-world 3D locations of the objects. Which object has a lower location? [O]",
+        "Based on the 3D positions of the objects, which one is placed at a lower elevation? [O]",
+        "Looking at the real-world 3D arrangement, which object is positioned lower? [O]",
+        "Considering the spatial positions of the objects in 3D space, which one sits lower? [O]",
+        # position.next_far
+        "Consider the real-world 3D locations of the objects. Are the [A] and the [B] next to each other or far away from each other? [O]",
+        "Based on the 3D spatial arrangement, are the [A] and the [B] close together or far apart? [O]",
+        "Looking at the real-world positions of the objects, are the [A] and the [B] near each other or distant? [O]",
+        "Considering the spatial layout, would you say the [A] and the [B] are adjacent or separated by a large distance? [O]",
+    ]),
+]
+
+# Pre-compiled patterns (populated on first call to _ensure_compiled).
+_COMPILED_RULES: List[Tuple[str, Optional[bool], List[re.Pattern]]] = []  # type: ignore[type-arg]
+
+
+def _ensure_compiled() -> None:
+    """Convert _TEMPLATE_RULES to compiled regex patterns (idempotent)."""
+    if _COMPILED_RULES:
+        return
+    for task, is_mv, templates in _TEMPLATE_RULES:
+        patterns: List[re.Pattern] = []  # type: ignore[type-arg]
+        for tpl in templates:
+            # Apply the same normalization as normalize_question_text.
+            norm = IMAGE_TOKEN_RE.sub(" ", tpl)
+            norm = WHITESPACE_RE.sub(" ", norm).strip().lower()
+            # Escape regex metacharacters, then convert [placeholder] → .+
+            # After lowercasing, [A] becomes [a], so match \[[a-z0-9]+\].
+            escaped = re.escape(norm)
+            # Replace escaped [placeholder] tokens with .* (zero-or-more).
+            # Using .* (not .+) so that trailing [O] / [T] placeholders
+            # (MCQ options / object lists) still match when absent in the data.
+            pat = re.sub(r"\\\[[a-z0-9]+\\\]", ".*", escaped)
+            # re.escape escapes spaces as '\ ', but unrecognised regex escapes are
+            # deprecated in Python 3.12+ and silently fail to match plain spaces.
+            # Spaces have no special regex meaning, so simply un-escape them.
+            pat = pat.replace(r"\ ", " ")
+            # Make (s) truly optional — counting templates use [A](s) for
+            # pluralisation.  \(s\)? only makes ')' optional; wrap the whole
+            # group: (?:\(s\))? makes the entire "(s)" optional.
+            pat = pat.replace(r"\(s\)", r"(?:\(s\))?")
+            # Templates that end with [O] (MCQ options) compile to '? .*'.
+            # Inputs without MCQ options end at '?' (no trailing space), so
+            # strip the space to turn '? .*' → '?.*' at end of pattern.
+            pat = re.sub(r" \.\*$", ".*", pat)
+            patterns.append(re.compile(pat))
+        _COMPILED_RULES.append((task, is_mv, patterns))
+
+
 def infer_subtask_from_row(row: Dict[str, Any]) -> Optional[str]:
+    _ensure_compiled()
     conversations = normalize_scalar(row.get("conversations")) or []
     images = normalize_scalar(row.get("images")) or []
 
     first_human = ""
-    first_gpt = ""
     for turn in conversations:
         if not isinstance(turn, dict):
             continue
@@ -124,136 +402,26 @@ def infer_subtask_from_row(row: Dict[str, Any]) -> Optional[str]:
         value = str(normalize_scalar(turn.get("value") or ""))
         if role == "human" and not first_human:
             first_human = value
-        if role == "gpt" and not first_gpt:
-            first_gpt = value
-        if first_human and first_gpt:
             break
 
     q = normalize_question_text(first_human)
-    a = normalize_question_text(first_gpt)
     img_count = len(images)
+
     if not q:
         return "unknown.multi_view" if img_count > 1 else "unknown.single_view"
 
-    def with_view_scope(base: str) -> str:
-        return f"{base}.multi_view" if img_count > 1 else f"{base}.single_view"
+    for task, is_mv_override, patterns in _COMPILED_RULES:
+        for pat in patterns:
+            if pat.search(q):
+                if is_mv_override is True:
+                    scope = "multi_view"
+                elif is_mv_override is False:
+                    scope = "single_view"
+                else:
+                    scope = "multi_view" if img_count > 1 else "single_view"
+                return f"{task}.{scope}"
 
-    # 3D grounding (+ camera system preamble in final conversation text)
-    if "camera intrinsic parameters" in q and "bbox_3d" in q:
-        return with_view_scope("grounding_3d")
-    if "3d bounding box" in q or "bbox_3d" in q or "3d location" in q:
-        return with_view_scope("grounding_3d")
-    if "bbox_3d" in a:
-        return with_view_scope("grounding_3d")
-
-    # Correspondence
-    if (
-        "point marked in" in q and "second image" in q and "matches the original" in q
-    ) or (
-        "point is highlighted" in q and "labeled" in q and "image one" in q
-    ):
-        return with_view_scope("correspondence")
-    if (
-        "show up in image 2" in q
-        or "from image 1 in image 2" in q
-        or "can you find the" in q and "image 2" in q
-    ):
-        return with_view_scope("correspondence")
-
-    # Multi-view tasks
-    if "view 1 and view 2" in q and "camera" in q and "in which view" in q:
-        return with_view_scope("distance")
-    if (
-        "image 1" in q and "image 2" in q
-    ) and (
-        "what direction is the" in q
-        or "from my position" in q
-        or "side of me" in q
-        or "with respect to the" in q
-    ):
-        return with_view_scope("position")
-    if (
-        "multi-view images" in q
-        or "given two different views" in q
-        or "different perspectives" in q
-    ) and (
-        "bigger than" in q
-        or "smaller than" in q
-        or "which one is the biggest" in q
-        or "which one is the smallest" in q
-    ):
-        return with_view_scope("size")
-    if (
-        "multi-view images" in q or "multiple perspectives" in q
-    ) and (
-        "farthest from" in q
-        or "closest to" in q
-        or "most distant from" in q
-        or "nearest to" in q
-    ):
-        return with_view_scope("distance")
-
-    # Single-view depth / counting / distance / size / position
-    if (
-        "from near to far" in q
-        or "closest to the camera" in q
-        or "farthest from the camera" in q
-        or "greatest depth" in q
-        or "smallest depth" in q
-    ):
-        return with_view_scope("depth")
-    if (
-        "how many" in q
-        or "number of" in q
-        or "count of" in q
-        or "please count" in q
-    ):
-        return with_view_scope("counting")
-    if "distance between the" in q and (
-        "meters" in q or "centimeters" in q or "real-world 3d location" in q
-    ):
-        return with_view_scope("distance")
-    if (
-        "which object is farther from" in q
-        or "which object is closer to" in q
-        or ("which of" in q and "is farther to" in q)
-        or ("which of" in q and "is closer to" in q)
-    ):
-        return with_view_scope("distance")
-    if (
-        "higher location" in q
-        or "lower location" in q
-        or "higher elevation" in q
-        or "lower elevation" in q
-    ):
-        return with_view_scope("position")
-    if (
-        "next to each other or far away from each other" in q
-        or "close together or far apart" in q
-        or "near each other or distant" in q
-    ):
-        return with_view_scope("position")
-    if (
-        "largest dimension" in q
-        or "longest side" in q
-        or "height of the" in q
-        or "how tall" in q
-        or "vertical measurement" in q
-        or "vertical dimension" in q
-    ):
-        return with_view_scope("size")
-    if "bigger than the" in q or "smaller than the" in q:
-        return with_view_scope("size")
-
-    # Caption task (if present in future dumps)
-    if (
-        "spatial relationship descriptions" in q
-        or "systematic visual documentation" in q
-        or "scene inventories" in q
-    ):
-        return with_view_scope("3d_scene_caption")
-
-    return with_view_scope("unknown")
+    return f"unknown.{'multi_view' if img_count > 1 else 'single_view'}"
 
 
 def extract_category(row: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:

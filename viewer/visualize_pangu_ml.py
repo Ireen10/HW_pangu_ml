@@ -12,6 +12,18 @@ from typing import Any, Dict, List, Optional, Tuple
 import streamlit as st
 
 
+@st.cache_data(show_spinner=False)
+def read_dataset_metadata(root_path: str) -> Optional[Dict[str, Any]]:
+    """Read output_root/metadata.json if present (small, low-memory)."""
+    try:
+        path = Path(root_path) / "metadata.json"
+        if not path.exists():
+            return None
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
 def _shard_id_from_name(path: Path) -> Optional[str]:
     stem = path.stem  # data_000000
     if not stem.startswith("data_"):
@@ -66,26 +78,84 @@ def total_samples(shards: List[Dict[str, Any]]) -> int:
     return sum(int(s["line_count"]) for s in shards)
 
 
-@st.cache_data(show_spinner=False)
-def build_category_index(root_path: str) -> Dict[str, List[int]]:
-    """Scan jsonl shards once; map category string (empty string if missing/null) -> global indices."""
-    shards = build_shard_index(root_path)
-    cat_map: Dict[str, List[int]] = {}
-    for shard in shards:
-        start = int(shard["start_index"])
+def _category_of_json_line(line: str) -> str:
+    obj = json.loads(line)
+    raw = obj.get("category")
+    return "" if raw is None else str(raw)
+
+
+def _ensure_category_matches_cached(
+    *,
+    root_path: str,
+    shards: List[Dict[str, Any]],
+    category: str,
+    need_upto_match_index: int,
+) -> Tuple[List[int], bool]:
+    """
+    Low-memory category filtering.
+
+    IMPORTANT: do NOT build a full category->indices map for huge datasets.
+    A 2.4M-row dataset would store ~2.4M integers (plus Python list overhead), easily hundreds of MB+.
+
+    Instead we scan forward incrementally and cache only the matches we've needed so far.
+    Returns (matches, exhausted).
+    """
+    key = f"cat_cache::{root_path}::{category}"
+    state = st.session_state.get(key)
+    if not isinstance(state, dict):
+        state = {"matches": [], "shard_pos": 0, "line_pos": 0, "exhausted": False}
+        st.session_state[key] = state
+
+    matches: List[int] = state["matches"]
+    if bool(state.get("exhausted")):
+        return matches, True
+
+    if need_upto_match_index < 0:
+        need_upto_match_index = 0
+
+    # Safety valve: cap cached match indices to keep memory bounded.
+    MAX_CACHED_MATCHES = 200_000
+
+    shard_pos = int(state["shard_pos"])
+    line_pos = int(state["line_pos"])
+
+    while len(matches) <= need_upto_match_index and shard_pos < len(shards):
+        shard = shards[shard_pos]
+        start_index = int(shard["start_index"])
         path = Path(shard["jsonl_path"])
         with path.open("r", encoding="utf-8") as f:
-            for line_idx, line in enumerate(f):
+            for i, line in enumerate(f):
+                if i < line_pos:
+                    continue
                 line = line.strip()
                 if not line:
                     continue
-                obj = json.loads(line)
-                raw = obj.get("category")
-                cat = "" if raw is None else str(raw)
-                if cat not in cat_map:
-                    cat_map[cat] = []
-                cat_map[cat].append(start + line_idx)
-    return cat_map
+                try:
+                    cat = _category_of_json_line(line)
+                except Exception:
+                    continue
+                if cat == category:
+                    matches.append(start_index + i)
+                    if len(matches) >= MAX_CACHED_MATCHES:
+                        state["exhausted"] = True
+                        state["shard_pos"] = shard_pos
+                        state["line_pos"] = i + 1
+                        return matches, True
+                if len(matches) > need_upto_match_index:
+                    state["shard_pos"] = shard_pos
+                    state["line_pos"] = i + 1
+                    return matches, False
+
+        shard_pos += 1
+        line_pos = 0
+        state["shard_pos"] = shard_pos
+        state["line_pos"] = 0
+
+    if shard_pos >= len(shards):
+        state["exhausted"] = True
+        return matches, True
+
+    return matches, False
 
 
 def find_shard_for_index(shards: List[Dict[str, Any]], index: int) -> Optional[Dict[str, Any]]:
@@ -539,28 +609,76 @@ def main() -> None:
     if n == 0:
         return
 
-    cat_map = build_category_index(root_input)
-    cat_options: List[str] = ["(全部)"]
-    if "" in cat_map:
-        cat_options.append("(未标注)")
-    cat_options.extend(sorted(k for k in cat_map.keys() if k != ""))
-    category_filter = st.selectbox("按 category 筛选", cat_options, index=0)
-    if category_filter == "(全部)":
-        view_indices = list(range(n))
-    elif category_filter == "(未标注)":
-        view_indices = cat_map.get("", [])
-    else:
-        view_indices = cat_map.get(category_filter, [])
-
-    n_view = len(view_indices)
-    st.caption(f"当前筛选下样本数: {n_view}")
-
     page_size = 2
-    total_pages = max(1, (n_view + page_size - 1) // page_size) if n_view > 0 else 1
-    page = int(st.number_input("页码", min_value=1, max_value=total_pages, value=1, step=1))
-    start = (page - 1) * page_size
-    slot_a = view_indices[start] if start < n_view else None
-    slot_b = view_indices[start + 1] if start + 1 < n_view else None
+    st.markdown("### 筛选（低内存）")
+    meta = read_dataset_metadata(root_input)
+    cat_dist: Dict[str, Any] = {}
+    if isinstance(meta, dict):
+        raw_dist = meta.get("category_distribution")
+        if isinstance(raw_dist, dict):
+            cat_dist = raw_dist
+
+    # Build dropdown options from metadata (no jsonl scan, low memory).
+    dropdown_labels: List[str] = ["(全部)"]
+    dropdown_to_value: Dict[str, str] = {"(全部)": ""}
+    if cat_dist:
+        for cat, info in sorted(
+            cat_dist.items(),
+            key=lambda kv: int(kv[1].get("count", 0)) if isinstance(kv[1], dict) else 0,
+            reverse=True,
+        ):
+            count = int(info.get("count", 0)) if isinstance(info, dict) else 0
+            label = f"{cat}  ({count})"
+            dropdown_labels.append(label)
+            dropdown_to_value[label] = str(cat)
+
+    if cat_dist:
+        selected_label = st.selectbox("按 category 筛选（来自 metadata.json）", dropdown_labels, index=0)
+        category_input = dropdown_to_value.get(selected_label, "")
+        with st.expander("高级：手动输入 category"):
+            manual = st.text_input(
+                "手动输入（留空则使用下拉选择）",
+                placeholder="例如: grounding_3d.single_view",
+            ).strip()
+            if manual:
+                category_input = manual
+    else:
+        st.caption("未找到 `metadata.json` 或其中无 `category_distribution`，回退到手动输入。")
+        category_input = st.text_input(
+            "按 category 筛选（留空=全部）",
+            placeholder="例如: grounding_3d.single_view",
+        ).strip()
+
+    if not category_input:
+        st.caption("当前筛选: 全部")
+        total_pages = (n + page_size - 1) // page_size
+        page = int(st.number_input("页码", min_value=1, max_value=total_pages, value=1, step=1))
+        start = (page - 1) * page_size
+        slot_a = start if start < n else None
+        slot_b = start + 1 if start + 1 < n else None
+        page_key = str(page)
+    else:
+        st.caption(f"当前筛选: category == `{category_input}`（流式扫描，避免一次性读入索引）")
+        match_offset = int(
+            st.number_input(
+                "匹配偏移（0 表示第 1 个匹配样本）",
+                min_value=0,
+                value=0,
+                step=page_size,
+            )
+        )
+        need_upto = match_offset + (page_size - 1)
+        matches, exhausted = _ensure_category_matches_cached(
+            root_path=root_input,
+            shards=shards,
+            category=category_input,
+            need_upto_match_index=need_upto,
+        )
+        slot_a = matches[match_offset] if match_offset < len(matches) else None
+        slot_b = matches[match_offset + 1] if match_offset + 1 < len(matches) else None
+        if slot_a is None and exhausted:
+            st.info("未找到更多匹配样本（已扫描到末尾或缓存已达上限）。")
+        page_key = f"m{match_offset}"
 
     left, right = st.columns(2)
     for col, idx, slot in [(left, slot_a, "left"), (right, slot_b, "right")]:
@@ -573,7 +691,7 @@ def main() -> None:
                 st.error(f"样本加载失败: index={idx}")
                 continue
             sample, tar_path = loaded
-            render_sample_card(sample, tar_path, card_key=f"{page}_{slot}_{idx}")
+            render_sample_card(sample, tar_path, card_key=f"{page_key}_{slot}_{idx}")
 
 
 if __name__ == "__main__":

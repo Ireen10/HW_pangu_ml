@@ -107,3 +107,27 @@ def test_newline_is_preserved_in_converted_user_text(monkeypatch) -> None:
     assert "line1\nline2" in user_text
     assert "<image>" not in user_text.lower()
 
+
+def test_multiview_distance_not_misclassified_as_grounding(monkeypatch) -> None:
+    script_path = Path(__file__).resolve().parents[1] / "convert_to_pangu_ml.py"
+    spec = importlib.util.spec_from_file_location("joyai_convert_to_pangu_ml", script_path)
+    assert spec is not None and spec.loader is not None
+    conv = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(conv)  # type: ignore[attr-defined]
+
+    # A distance prompt that mentions 3D (and could include camera params in some dumps).
+    human = (
+        "Here are the detailed camera parameters for the image. "
+        "Camera intrinsic parameters: Horizontal fov, hfov=62.26, and vertical fov, vfov=48.74. "
+        "Image width=256 and height=192. "
+        "Consider the real-world 3D location of the objects. What is the distance between the chair and the table (in meters)?"
+    )
+    row = _example_row_from_readme()
+    row["conversations"][0]["value"] = human
+    row["conversations"][1]["value"] = "1.25 m"
+    # Simulate multiview by providing multiple images.
+    row["images"] = [{"bytes": b"a"}, {"bytes": b"b"}]
+
+    cat = conv.infer_subtask_from_row(row)
+    assert cat == "distance.multi_view"
+
