@@ -251,6 +251,9 @@ _TEMPLATE_RULES: List[Tuple[str, Optional[bool], List[str]]] = [
         "Considering the [T] [A], which one is the most distant from the camera?",
         "Out of the [T] [A], which one has the greatest depth?",
         "From the [T] [A], which is the one with the largest depth?",
+        # depth_farthest_questions_mcq[5] uses "which one is" instead of "which is" —
+        # an inconsistency in the OpenSpatial source that defeats the MCQ-omission assumption.
+        "From the [T] [A], which one is the one with the largest depth?",
         # depth.closest
         "Between the [T] [A], which one is the closest to the camera?",
         "Among the [T] [A], which one is the nearest to the camera?",
