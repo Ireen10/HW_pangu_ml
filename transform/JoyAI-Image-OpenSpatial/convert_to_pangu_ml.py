@@ -46,13 +46,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--parquet-dir",
-        required=True,
+        default="/home/ma-user/work/preliminary_grounding/training_data/3DGrounding/raw_data/JoyAI-Image-OpenSpatial/data/",
         type=Path,
         help="Directory containing source parquet files.",
     )
     parser.add_argument(
         "--output-root",
-        required=True,
+        default="/home/ma-user/work/preliminary_grounding/z00848098/data/pangu_ml/JoyAI-Image-OpenSpatial/",
         type=Path,
         help="Output root. Will create images/ and jsonl/ under this directory.",
     )
