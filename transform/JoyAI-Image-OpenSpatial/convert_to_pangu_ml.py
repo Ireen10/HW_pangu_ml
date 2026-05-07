@@ -129,6 +129,8 @@ _TEMPLATE_RULES: List[Tuple[str, Optional[bool], List[str]]] = [
         # point2point — distinctive endings (templates use typographic quotes around
         # labels, so we match by unique trailing phrases that have no encoding issues)
         "which matches the original?",
+        "which one matches the original?",
+        "which point matches the original?",
         "can you identify the corresponding point?",
         # object2object
         "Does the [A] in image 1 show up in image 2?",
