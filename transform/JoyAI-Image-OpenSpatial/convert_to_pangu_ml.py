@@ -738,6 +738,7 @@ def _process_parquet_file_task(
     category_field: Optional[str] = None
     category_counter: Counter = Counter()
     data_source_counter: Counter = Counter()
+    image_count_counter: Counter = Counter()
     total_seen = 0
     skipped = 0
     converted_records: List[Tuple[Dict[str, Any], List[Tuple[str, bytes]]]] = []
@@ -747,6 +748,10 @@ def _process_parquet_file_task(
         total_seen += 1
         data_source = str(normalize_scalar(row.get("data_source") or "unknown_source"))
         data_source_counter[data_source] += 1
+
+        images_raw = normalize_scalar(row.get("images"))
+        n_images = len(images_raw) if isinstance(images_raw, list) else 0
+        image_count_counter[n_images] += 1
 
         cf, cv = extract_category(row)
         if cv:
@@ -767,6 +772,7 @@ def _process_parquet_file_task(
         "converted_records": converted_records,
         "category_counter": dict(category_counter),
         "data_source_counter": dict(data_source_counter),
+        "image_count_counter": dict(image_count_counter),
         "category_field": category_field,
     }
 
@@ -817,6 +823,7 @@ def main() -> None:
     stats = ConvertStats()
     category_counter: Counter = Counter()
     data_source_counter: Counter = Counter()
+    image_count_counter: Counter = Counter()
 
     shard_id = 0
     shard_written = 0
@@ -840,6 +847,7 @@ def main() -> None:
             stats.skipped += int(res["skipped"])
             category_counter.update(res["category_counter"])
             data_source_counter.update(res["data_source_counter"])
+            image_count_counter.update(res["image_count_counter"])
             if stats.category_field is None and res.get("category_field"):
                 stats.category_field = res["category_field"]
 
@@ -904,6 +912,17 @@ def main() -> None:
             }
             for k, v in data_source_counter.items()
         }
+    # Keys are ints (image count per sample); sort numerically for readability.
+    if stats.total_seen == 0:
+        image_count_distribution = {}
+    else:
+        image_count_distribution = {
+            str(k): {
+                "count": v,
+                "ratio": round(v / stats.total_seen, 6),
+            }
+            for k, v in sorted(image_count_counter.items())
+        }
 
     # Full parquet row count: only known after a complete scan (no early cap break).
     # Avoids a separate pre-pass over all parquet metadata for small-batch runs.
@@ -930,6 +949,7 @@ def main() -> None:
         "has_category": bool(category_counter),
         "category_distribution": category_distribution,
         "data_source_distribution": data_source_distribution,
+        "image_count_distribution": image_count_distribution,
     }
 
     metadata_path = output_root / "metadata.json"
@@ -962,6 +982,12 @@ def main() -> None:
             print(f"  - {name}: count={info['count']}, ratio={info['ratio']:.6f}")
     else:
         print("data_source_distribution: <none detected>")
+    if image_count_counter:
+        print("image_count_distribution:")
+        for n_img, info in sorted(image_count_distribution.items(), key=lambda x: int(x[0])):
+            print(f"  - {n_img} image(s): count={info['count']}, ratio={info['ratio']:.6f}")
+    else:
+        print("image_count_distribution: <none detected>")
     print(f"metadata_json: {metadata_path}")
 
 
