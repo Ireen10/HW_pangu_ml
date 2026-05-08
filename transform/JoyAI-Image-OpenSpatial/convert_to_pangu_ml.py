@@ -5,7 +5,8 @@ import io
 import json
 import re
 import tarfile
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import itertools
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, as_completed, wait as _fut_wait
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -871,15 +872,80 @@ def main() -> None:
         if not tasks:
             pass
         elif workers_eff == 1:
-            for t in tasks:
-                _write_one_file_result(_process_parquet_file_task(t))
+            # ── Single-process: truly streaming, zero accumulation ────────────
+            # Process each row inline and write to tar/jsonl immediately.
+            # No converted_records list → memory stays constant regardless of
+            # dataset size (only one row's decoded image bytes live at a time).
+            def _stream_one_file(
+                fi: int, path_str: str, batch_size: int, max_rows: Optional[int]
+            ) -> None:
+                nonlocal shard_id, shard_written, shard_tar, shard_jsonl
+                path = Path(path_str)
+                base_index = fi * _INDEX_STRIDE
+                for local_idx, row in enumerate(
+                    iter_parquet_rows_single_file(path, batch_size, max_rows)
+                ):
+                    stats.total_seen += 1
+                    data_source = str(normalize_scalar(row.get("data_source") or "unknown_source"))
+                    data_source_counter[data_source] += 1
+                    images_raw = normalize_scalar(row.get("images"))
+                    n_images = len(images_raw) if isinstance(images_raw, list) else 0
+                    image_count_counter[n_images] += 1
+
+                    cf, cv = extract_category(row)
+                    if cv:
+                        if stats.category_field is None:
+                            stats.category_field = cf or "inferred_subtask_from_prompt"
+                        category_counter[cv] += 1
+
+                    parts = build_pangu_sample_parts(row, base_index + local_idx, cv)
+                    if parts is None:
+                        stats.skipped += 1
+                        continue
+
+                    sample_dict, tar_members = parts
+                    for rel_path, img_bytes in tar_members:
+                        ti = tarfile.TarInfo(name=rel_path)
+                        ti.size = len(img_bytes)
+                        shard_tar.addfile(tarinfo=ti, fileobj=io.BytesIO(img_bytes))
+                    shard_jsonl.write(json.dumps(sample_dict, ensure_ascii=False) + "\n")
+                    stats.converted += 1
+                    shard_written += 1
+                    if pbar is not None:
+                        pbar.update(1)
+                    if shard_written >= args.shard_size:
+                        shard_tar.close()
+                        shard_jsonl.close()
+                        shard_id += 1
+                        shard_written = 0
+                        shard_tar, shard_jsonl = create_shard_handles(output_root, shard_id)
+
+            for fi, path_str, batch_size, max_rows in tasks:
+                _stream_one_file(fi, path_str, batch_size, max_rows)
         else:
+            # ── Multi-process: bounded sliding-window ─────────────────────────
+            # Pre-allocating ALL futures at once keeps every completed result
+            # (decoded image bytes) alive in Future._result until the entire run
+            # finishes, causing O(files) memory growth and a matching slowdown.
+            # Fix: keep at most (workers × 2) futures in-flight; discard each
+            # Future object as soon as its result has been written so that
+            # Python's reference-counting can immediately free the image bytes.
             max_w = min(workers_eff, len(tasks))
+            _LOOKAHEAD = max_w * 2
             with ProcessPoolExecutor(max_workers=max_w) as ex:
-                futures = [ex.submit(_process_parquet_file_task, t) for t in tasks]
-                for fut in as_completed(futures):
-                    # Write as soon as a file finishes to keep progress moving.
-                    _write_one_file_result(fut.result())
+                task_iter = iter(tasks)
+                pending: set = set()
+                for t in itertools.islice(task_iter, _LOOKAHEAD):
+                    pending.add(ex.submit(_process_parquet_file_task, t))
+                while pending:
+                    done, pending = _fut_wait(pending, return_when=FIRST_COMPLETED)
+                    for fut in done:
+                        _write_one_file_result(fut.result())
+                        # 'fut' is not stored anywhere after this loop body →
+                        # Future._result (decoded image bytes) freed immediately.
+                        t = next(task_iter, None)
+                        if t is not None:
+                            pending.add(ex.submit(_process_parquet_file_task, t))
     finally:
         shard_tar.close()
         shard_jsonl.close()
