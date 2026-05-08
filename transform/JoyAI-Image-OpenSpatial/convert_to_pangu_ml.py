@@ -43,6 +43,16 @@ WHITESPACE_RE = re.compile(r"\s+")
 PATH_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
+def normalize_data_source(value: Any) -> str:
+    raw = str(normalize_scalar(value or "unknown_source")).strip()
+    s = raw.lower().replace("_", "-").replace(" ", "")
+    if s in ("matterport3d", "matterpod3d", "matterpot3d"):
+        return "matterport3d"
+    if s in ("egoexo4d", "ego-exo4d"):
+        return "Ego-Exo4D"
+    return raw or "unknown_source"
+
+
 @dataclass
 class ConvertStats:
     total_seen: int = 0
@@ -483,7 +493,11 @@ def infer_subtask_from_row(row: Dict[str, Any]) -> Optional[str]:
                     scope = "multi_view" if img_count > 1 else "single_view"
                 return f"{task}.{scope}"
 
-    return f"unknown.{'multi_view' if img_count > 1 else 'single_view'}"
+    # Dataset-specific resolution: after auditing, remaining unknowns are
+    # consistently position (single-view) and camera_motion (multi-view).
+    if img_count > 1:
+        return "camera_motion.multi_view"
+    return "position.single_view"
 
 
 def extract_category(row: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
@@ -747,7 +761,7 @@ def _process_parquet_file_task(
 
     for local_idx, row in enumerate(iter_parquet_rows_single_file(path, batch_size, max_rows)):
         total_seen += 1
-        data_source = str(normalize_scalar(row.get("data_source") or "unknown_source"))
+        data_source = normalize_data_source(row.get("data_source"))
         data_source_counter[data_source] += 1
 
         images_raw = normalize_scalar(row.get("images"))
@@ -886,7 +900,7 @@ def main() -> None:
                     iter_parquet_rows_single_file(path, batch_size, max_rows)
                 ):
                     stats.total_seen += 1
-                    data_source = str(normalize_scalar(row.get("data_source") or "unknown_source"))
+                    data_source = normalize_data_source(row.get("data_source"))
                     data_source_counter[data_source] += 1
                     images_raw = normalize_scalar(row.get("images"))
                     n_images = len(images_raw) if isinstance(images_raw, list) else 0
