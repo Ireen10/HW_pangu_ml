@@ -27,7 +27,17 @@ DATASET_NAME = "jdopensource/JoyAI-Image-OpenSpatial"
 ROLE_MAP = {"human": "user", "gpt": "assistant"}
 IMAGE_FORMAT = "image/jpeg"
 CATEGORY_KEYS = ("category", "sub_category", "subcategory", "ability", "task", "label")
-IMAGE_TOKEN_RE = re.compile(r"\s*<image>\s*", flags=re.IGNORECASE)
+# Matches common image-placeholder tokens used by different VLMs:
+#   <image>           LLaVA / ShareGPT4V style
+#   <image_pad>       some InternVL variants
+#   <|image_pad|>     Qwen2-VL / Qwen2.5-VL  ← new source in this dataset
+#   <|image|>         Phi-3 Vision
+# Using re.IGNORECASE so <IMAGE> etc. are also covered.
+IMAGE_TOKEN_RE = re.compile(
+    r"\s*(?:<\|image(?:_pad)?\|>|<image(?:_pad)?(?:\s[^>]*)?>"
+    r")\s*",
+    flags=re.IGNORECASE,
+)
 WHITESPACE_RE = re.compile(r"\s+")
 PATH_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -228,7 +238,13 @@ _TEMPLATE_RULES: List[Tuple[str, Optional[bool], List[str]]] = [
         "Highlight the 3D bounding box that frames the [A] observed in the image.",
         "Predict the 3D location of the [A] observed in the image.",
         # camera_system_prompt terminal phrase (grounding_3d.camera_system template)
+        # In practice the camera preamble is always prepended (see 3d_grounding.py line 69),
+        # so this phrase acts as the primary catch-all for all grounding_3d samples.
         'Output a json list where each entry contains the object name in "label" and its 3D bounding box in "bbox_3d".',
+        # grounding_3d MCQ templates with unique opening verbs not shared with open-ended set.
+        # The grounding task only generates open-ended QA, but these are kept as defensive patterns.
+        "Determine the dimensions of the 3D bounding box for the [A] in this context.",
+        "Calculate the 3D bounding box dimensions for the [A] depicted in the scene.",
     ]),
 
     # ── Depth (always single-view) ──────────────────────────────────────────
@@ -354,6 +370,46 @@ _TEMPLATE_RULES: List[Tuple[str, Optional[bool], List[str]]] = [
         "Based on the 3D spatial arrangement, are the [A] and the [B] close together or far apart? [O]",
         "Looking at the real-world positions of the objects, are the [A] and the [B] near each other or distant? [O]",
         "Considering the spatial layout, would you say the [A] and the [B] are adjacent or separated by a large distance? [O]",
+    ]),
+
+    # ── Keyword-based fallbacks for non-OpenSpatial data sources ─────────────
+    # Placed LAST so they only fire when no OpenSpatial template matched above.
+    # These are plain-substring anchors, not full template strings, so the
+    # placeholder-escape pipeline in _ensure_compiled is harmless (no [X] tokens).
+
+    # 2-D camera-view spatial relationship (left / right / above / below).
+    # OpenSpatial position templates only cover 3-D elevation and proximity;
+    # questions like "Is the X located on the left-hand side of the Y?"
+    # and "Which is above, the X or the Y?" come from external datasets.
+    # is_mv=None → scope determined by img_count at runtime.
+    ("position", None, [
+        "left-hand side",
+        "right-hand side",
+        "on the left of",
+        "on the right of",
+        "to the left of",
+        "to the right of",
+        "which is above",
+        "which is below",
+        "which one is above",
+        "which one is below",
+        "is it above",
+        "is it below",
+        "is it on the left",
+        "is it on the right",
+    ]),
+
+    # Egocentric / video camera-motion questions (multiple frames from a stream).
+    # Example: "<|image_pad|><|image_pad|>The frames are gathered in a continuous
+    #  stream from a first-person perspective. If we only think about the camera's
+    #  horizontal translation, does it move left or right?"
+    # Always multi-view (multiple frames imply img_count > 1).
+    ("camera_motion", True, [
+        "first-person perspective",
+        "horizontal translation",
+        "vertical translation",
+        "camera movement",
+        "camera translate",
     ]),
 ]
 
