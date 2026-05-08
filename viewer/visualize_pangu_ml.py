@@ -166,27 +166,89 @@ def find_shard_for_index(shards: List[Dict[str, Any]], index: int) -> Optional[D
 
 
 @st.cache_data(show_spinner=False)
-def get_row_from_jsonl(jsonl_path: str, line_idx: int) -> Optional[Dict[str, Any]]:
+def build_jsonl_seek_index(jsonl_path: str, stride_lines: int = 1024) -> Dict[str, Any]:
+    """
+    Build a sparse seek index for a jsonl file: record the byte offset at every
+    `stride_lines` boundary so we can seek close to the target line and scan only
+    within one block.
+
+    Memory: O(num_lines/stride_lines) integers. For 2.4M lines and stride=1024,
+    that's ~2344 offsets (tiny).
+    """
     path = Path(jsonl_path)
-    with path.open("r", encoding="utf-8") as f:
-        for idx, line in enumerate(f):
-            if idx == line_idx:
-                line = line.strip()
-                if not line:
+    offsets: List[int] = [0]
+    total_lines = 0
+    # Use binary mode to make offsets deterministic across platforms.
+    with path.open("rb") as f:
+        while True:
+            pos = f.tell()
+            line = f.readline()
+            if not line:
+                break
+            total_lines += 1
+            if total_lines % stride_lines == 0:
+                offsets.append(f.tell())
+            # avoid unused var warning for pos (kept for clarity)
+            _ = pos
+    return {"stride_lines": int(stride_lines), "offsets": offsets, "total_lines": total_lines}
+
+
+@st.cache_data(show_spinner=False)
+def get_row_from_jsonl(jsonl_path: str, line_idx: int) -> Optional[Dict[str, Any]]:
+    """
+    Fast random access into a jsonl file using a sparse seek index.
+    Falls back to linear scan within a small block (<= stride_lines).
+    """
+    if line_idx < 0:
+        return None
+    idx = build_jsonl_seek_index(jsonl_path)
+    stride = int(idx["stride_lines"])
+    offsets: List[int] = list(idx["offsets"])
+    if stride <= 0 or not offsets:
+        return None
+    block = line_idx // stride
+    if block >= len(offsets):
+        # Past EOF
+        return None
+    start_offset = int(offsets[block])
+    start_line = block * stride
+    path = Path(jsonl_path)
+    with path.open("rb") as f:
+        f.seek(start_offset)
+        cur = start_line
+        while True:
+            raw = f.readline()
+            if not raw:
+                return None
+            if cur == line_idx:
+                try:
+                    line = raw.decode("utf-8").strip()
+                    if not line:
+                        return None
+                    return json.loads(line)
+                except Exception:
                     return None
-                return json.loads(line)
-    return None
+            cur += 1
+
+
+@st.cache_resource(show_spinner=False)
+def _open_tar_cached(tar_path: str) -> tarfile.TarFile:
+    """
+    Keep tar handles open across reruns to avoid re-reading headers on every image.
+    This makes repeated paging/preview much faster.
+    """
+    return tarfile.open(tar_path, "r")
 
 
 @st.cache_data(show_spinner=False)
 def get_image_bytes_from_tar(tar_path: str, relative_path: str) -> Optional[bytes]:
     try:
-        with tarfile.open(tar_path, "r") as tf:
-            member = tf.getmember(relative_path)
-            f = tf.extractfile(member)
-            if f is None:
-                return None
-            return f.read()
+        tf = _open_tar_cached(tar_path)
+        member = tf.getmember(relative_path)
+        f = tf.extractfile(member)
+        if f is None:
+            return None
+        return f.read()
     except Exception:
         return None
 
