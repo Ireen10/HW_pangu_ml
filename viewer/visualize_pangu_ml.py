@@ -132,8 +132,9 @@ def render_metadata_distribution_section(meta: Optional[Dict[str, Any]], *, pie_
         return
 
     CHART_H = 260
+    # Altair 6.1: encoding `radius` with selection (alt.condition / alt.when) serializes
+    # to RadiusValue + condition, which the schema rejects. Use fixed outerRadius on mark.
     PIE_OUTER = 112
-    PIE_OUTER_HOVER = 128
 
     def _pie_altair(items: List[Tuple[str, int]], title: str) -> Any:
         collapsed = _collapse_top_n(items, pie_top_n)
@@ -151,29 +152,23 @@ def render_metadata_distribution_section(meta: Optional[Dict[str, Any]], *, pie_
             fields=["label"],
             empty=False,
         )
-        # Altair 6: alt.condition(...) on some channels (e.g. radius) is rejected by the
-        # schema; use when/then/otherwise for interactive ValueDefs.
         return (
             alt.Chart(df)
             .mark_arc(
                 innerRadius=52,
+                outerRadius=PIE_OUTER,
                 padAngle=0.012,
                 cornerRadius=3,
             )
             .encode(
                 theta=alt.Theta("count:Q", stack=True),
-                radius=alt.when(hover)
-                .then(alt.value(PIE_OUTER_HOVER))
-                .otherwise(alt.value(PIE_OUTER)),
                 color=alt.Color(
                     "label:N",
                     legend=alt.Legend(title=None, orient="right", labelLimit=100, labelFontSize=10),
                 ),
-                opacity=alt.when(hover).then(alt.value(1)).otherwise(alt.value(0.88)),
-                stroke=alt.when(hover)
-                .then(alt.value("#f8fafc"))
-                .otherwise(alt.value("#ffffff")),
-                strokeWidth=alt.when(hover).then(alt.value(3)).otherwise(alt.value(0.6)),
+                opacity=alt.condition(hover, alt.value(1), alt.value(0.88)),
+                stroke=alt.condition(hover, alt.value("#f8fafc"), alt.value("#ffffff")),
+                strokeWidth=alt.condition(hover, alt.value(3), alt.value(0.6)),
                 tooltip=[
                     alt.Tooltip("label:N", title="类别"),
                     alt.Tooltip("count:Q", title="数量", format=","),
@@ -221,7 +216,8 @@ def render_metadata_distribution_section(meta: Optional[Dict[str, Any]], *, pie_
             y_max = y_min * 10
         return (
             alt.Chart(df)
-            .mark_bar(cornerRadiusEnd=3)
+            # Fixed bar width: conditional `size` can hit the same schema class of issues as radius.
+            .mark_bar(size=28, cornerRadiusEnd=3)
             .encode(
                 x=alt.X("n_images:N", title="图像数量（张）", sort=None),
                 y=alt.Y(
@@ -229,15 +225,10 @@ def render_metadata_distribution_section(meta: Optional[Dict[str, Any]], *, pie_
                     title="样本数（log₁₀）",
                     scale=alt.Scale(type="log", base=10, domain=[y_min, y_max], nice=True, clamp=True),
                 ),
-                color=alt.when(hover)
-                .then(alt.value("#5B9BD5"))
-                .otherwise(alt.value("#4C78A8")),
-                size=alt.when(hover).then(alt.value(34)).otherwise(alt.value(26)),
-                stroke=alt.when(hover)
-                .then(alt.value("#1a2f4a"))
-                .otherwise(alt.value("transparent")),
-                strokeWidth=alt.when(hover).then(alt.value(2)).otherwise(alt.value(0)),
-                opacity=alt.when(hover).then(alt.value(1)).otherwise(alt.value(0.92)),
+                color=alt.condition(hover, alt.value("#5B9BD5"), alt.value("#4C78A8")),
+                stroke=alt.condition(hover, alt.value("#1a2f4a"), alt.value("transparent")),
+                strokeWidth=alt.condition(hover, alt.value(2), alt.value(0)),
+                opacity=alt.condition(hover, alt.value(1), alt.value(0.92)),
                 tooltip=[
                     alt.Tooltip("n_images:N", title="张数"),
                     alt.Tooltip("count:Q", title="数量", format=","),
@@ -250,7 +241,10 @@ def render_metadata_distribution_section(meta: Optional[Dict[str, Any]], *, pie_
         )
 
     st.markdown("#### 数据分布（metadata.json）")
-    st.caption("悬停扇区或柱子：高亮并略「浮起」；柱图为对数纵轴，便于看清小样本。")
+    st.caption(
+        "悬停高亮：描边与透明度变化（Altair 6.1 无法在半径通道绑定选择，故外径固定）。"
+        "柱图为对数纵轴，便于看清小样本。"
+    )
     c1, c2 = st.columns(2)
     with c1:
         if cat_items:
