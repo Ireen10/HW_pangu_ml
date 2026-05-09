@@ -326,6 +326,175 @@ def render_metadata_distribution_section(meta: Optional[Dict[str, Any]], *, pie_
         st.caption("无 image_count 分布数据")
 
 
+def render_resolution_stats_section(
+    meta: Optional[Dict[str, Any]], *, heatmap_top_sources: int = 16
+) -> None:
+    """Visualize metadata['resolution_stats'] (megapixel + short-edge + per-source heatmap)."""
+    if not meta or not isinstance(meta.get("resolution_stats"), dict):
+        st.caption(
+            "无 `resolution_stats`。请使用新版 `convert_to_pangu_ml.py` 转换，或运行 "
+            "`transform/JoyAI-Image-OpenSpatial/enrich_metadata_resolution.py` 扫描 jsonl 写入。"
+        )
+        return
+
+    rs = meta["resolution_stats"]
+    try:
+        import altair as alt
+        import pandas as pd
+    except ImportError:
+        st.warning("需要 **altair**、**pandas** 以显示分辨率图。")
+        return
+
+    st.markdown("#### 图像分辨率统计（metadata · resolution_stats）")
+    if isinstance(rs.get("description"), str):
+        st.caption(rs["description"])
+
+    tot = int(rs.get("total_images", 0))
+    unk = int(rs.get("unknown_geometry", 0))
+    st.metric("总图像张数", f"{tot:,}")
+    if unk:
+        st.caption(f"其中几何未知（宽高无效）: {unk:,} 张")
+
+    mp_order = [str(x) for x in (rs.get("megapixel_bucket_order") or [])]
+    se_order = [str(x) for x in (rs.get("short_edge_bucket_order") or [])]
+
+    def _rows_from_dist(dist: Any, order: List[str]) -> List[Dict[str, Any]]:
+        if not isinstance(dist, dict):
+            return []
+        out: List[Dict[str, Any]] = []
+        for k in order:
+            if k not in dist:
+                continue
+            d = dist[k]
+            if not isinstance(d, dict):
+                continue
+            out.append(
+                {
+                    "bucket": k,
+                    "count": int(d.get("count", 0)),
+                    "ratio": float(d.get("ratio", 0.0)),
+                }
+            )
+        return out
+
+    mp_dist = rs.get("megapixel_bucket_distribution") or {}
+    se_dist = rs.get("short_edge_bucket_distribution") or {}
+    df_mp = pd.DataFrame(_rows_from_dist(mp_dist, mp_order))
+    df_se = pd.DataFrame(_rows_from_dist(se_dist, se_order))
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if not df_mp.empty:
+            ch = (
+                alt.Chart(df_mp)
+                .mark_bar(color="#2ca02c")
+                .encode(
+                    x=alt.X("bucket:N", sort=mp_order, title="Megapixel 分桶 (w×h/10⁶)"),
+                    y=alt.Y("count:Q", title="图像张数"),
+                    tooltip=[
+                        "bucket",
+                        "count",
+                        alt.Tooltip("ratio:Q", title="占全部图像", format=".2%"),
+                    ],
+                )
+                .properties(height=260, title="全局 · 百万像素")
+            )
+            st.altair_chart(ch, use_container_width=True)
+        else:
+            st.caption("无 megapixel 分布")
+    with c2:
+        if not df_se.empty:
+            ch = (
+                alt.Chart(df_se)
+                .mark_bar(color="#ff7f0e")
+                .encode(
+                    x=alt.X("bucket:N", sort=se_order, title="短边 min(w,h)"),
+                    y=alt.Y("count:Q", title="图像张数"),
+                    tooltip=[
+                        "bucket",
+                        "count",
+                        alt.Tooltip("ratio:Q", title="占全部图像", format=".2%"),
+                    ],
+                )
+                .properties(height=260, title="全局 · 短边像素")
+            )
+            st.altair_chart(ch, use_container_width=True)
+        else:
+            st.caption("无短边分布")
+
+    by_ds = rs.get("by_data_source") or {}
+    if not isinstance(by_ds, dict) or not by_ds:
+        return
+
+    ranked = sorted(
+        by_ds.items(),
+        key=lambda kv: int(kv[1].get("total_images", 0)) if isinstance(kv[1], dict) else 0,
+        reverse=True,
+    )[: max(3, int(heatmap_top_sources))]
+
+    hm_rows: List[Dict[str, Any]] = []
+    for src, info in ranked:
+        if not isinstance(info, dict):
+            continue
+        sub = info.get("megapixel_bucket_distribution") or {}
+        for bkt in mp_order:
+            if isinstance(sub.get(bkt), dict):
+                cnt = int(sub[bkt].get("count", 0))
+                ratio = float(sub[bkt].get("ratio", 0.0))
+            else:
+                cnt, ratio = 0, 0.0
+            hm_rows.append(
+                {"source": str(src), "bucket": bkt, "count": cnt, "ratio": ratio}
+            )
+
+    if hm_rows:
+        df_h = pd.DataFrame(hm_rows)
+        n_src = df_h["source"].nunique()
+        src_order = [str(s) for s, _ in ranked]
+        ch = (
+            alt.Chart(df_h)
+            .mark_rect()
+            .encode(
+                x=alt.X("bucket:N", sort=mp_order, title="Megapixel 分桶"),
+                y=alt.Y("source:N", title="data_source", sort=src_order),
+                color=alt.Color(
+                    "count:Q",
+                    scale=alt.Scale(scheme="blues"),
+                    legend=alt.Legend(title="张数"),
+                ),
+                tooltip=[
+                    "source",
+                    "bucket",
+                    "count",
+                    alt.Tooltip("ratio:Q", title="占该来源", format=".2%"),
+                ],
+            )
+            .properties(
+                height=min(560, 24 * n_src + 100),
+                title=f"各来源 × Megapixel（前 {len(ranked)} 个来源，按图像数）",
+            )
+        )
+        st.altair_chart(ch, use_container_width=True)
+
+    with st.expander("各来源宽高范围（min/max）"):
+        lines = []
+        for src, info in ranked:
+            if not isinstance(info, dict):
+                continue
+            lines.append(
+                {
+                    "来源": src,
+                    "图像数": info.get("total_images"),
+                    "宽 min": info.get("width_min"),
+                    "宽 max": info.get("width_max"),
+                    "高 min": info.get("height_min"),
+                    "高 max": info.get("height_max"),
+                }
+            )
+        if lines:
+            st.dataframe(pd.DataFrame(lines), use_container_width=True, hide_index=True)
+
+
 def _ensure_filter_matches_cached(
     *,
     root_path: str,
@@ -929,6 +1098,9 @@ def main() -> None:
             key="dist_pie_top_n",
         )
         render_metadata_distribution_section(meta, pie_top_n=int(pie_top))
+
+    with st.expander("图像分辨率（resolution_stats）", expanded=False):
+        render_resolution_stats_section(meta, heatmap_top_sources=16)
 
     page_size = 2
     st.markdown("### 筛选（低内存）")

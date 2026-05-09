@@ -14,6 +14,14 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pyarrow.parquet as pq
 
+from resolution_stats import (
+    accumulate_from_pangu_sample,
+    accumulator_to_serializable_dict,
+    empty_resolution_accumulator,
+    merge_resolution_accumulators,
+    resolution_accumulator_to_metadata,
+)
+
 try:
     from tqdm import tqdm
 except ImportError:  # pragma: no cover
@@ -754,6 +762,7 @@ def _process_parquet_file_task(
     category_counter: Counter = Counter()
     data_source_counter: Counter = Counter()
     image_count_counter: Counter = Counter()
+    resolution_acc = empty_resolution_accumulator()
     total_seen = 0
     skipped = 0
     converted_records: List[Tuple[Dict[str, Any], List[Tuple[str, bytes]]]] = []
@@ -778,6 +787,10 @@ def _process_parquet_file_task(
         if parts is None:
             skipped += 1
             continue
+        sample_dict, _tar = parts
+        accumulate_from_pangu_sample(
+            resolution_acc, sample_dict, normalize_data_source_fn=normalize_data_source
+        )
         converted_records.append(parts)
 
     return {
@@ -788,6 +801,7 @@ def _process_parquet_file_task(
         "category_counter": dict(category_counter),
         "data_source_counter": dict(data_source_counter),
         "image_count_counter": dict(image_count_counter),
+        "resolution_stats_partial": accumulator_to_serializable_dict(resolution_acc),
         "category_field": category_field,
     }
 
@@ -839,6 +853,7 @@ def main() -> None:
     category_counter: Counter = Counter()
     data_source_counter: Counter = Counter()
     image_count_counter: Counter = Counter()
+    resolution_acc = empty_resolution_accumulator()
 
     shard_id = 0
     shard_written = 0
@@ -863,6 +878,8 @@ def main() -> None:
             category_counter.update(res["category_counter"])
             data_source_counter.update(res["data_source_counter"])
             image_count_counter.update(res["image_count_counter"])
+            if res.get("resolution_stats_partial"):
+                merge_resolution_accumulators(resolution_acc, res["resolution_stats_partial"])
             if stats.category_field is None and res.get("category_field"):
                 stats.category_field = res["category_field"]
 
@@ -893,7 +910,7 @@ def main() -> None:
             def _stream_one_file(
                 fi: int, path_str: str, batch_size: int, max_rows: Optional[int]
             ) -> None:
-                nonlocal shard_id, shard_written, shard_tar, shard_jsonl
+                nonlocal shard_id, shard_written, shard_tar, shard_jsonl, resolution_acc
                 path = Path(path_str)
                 base_index = fi * _INDEX_STRIDE
                 for local_idx, row in enumerate(
@@ -918,6 +935,11 @@ def main() -> None:
                         continue
 
                     sample_dict, tar_members = parts
+                    accumulate_from_pangu_sample(
+                        resolution_acc,
+                        sample_dict,
+                        normalize_data_source_fn=normalize_data_source,
+                    )
                     for rel_path, img_bytes in tar_members:
                         ti = tarfile.TarInfo(name=rel_path)
                         ti.size = len(img_bytes)
@@ -1030,6 +1052,7 @@ def main() -> None:
         "category_distribution": category_distribution,
         "data_source_distribution": data_source_distribution,
         "image_count_distribution": image_count_distribution,
+        "resolution_stats": resolution_accumulator_to_metadata(resolution_acc),
     }
 
     metadata_path = output_root / "metadata.json"
@@ -1068,6 +1091,10 @@ def main() -> None:
             print(f"  - {n_img} image(s): count={info['count']}, ratio={info['ratio']:.6f}")
     else:
         print("image_count_distribution: <none detected>")
+    rs = metadata.get("resolution_stats") or {}
+    ti = rs.get("total_images")
+    if ti is not None:
+        print(f"resolution_stats.total_images: {ti}")
     print(f"metadata_json: {metadata_path}")
 
 
