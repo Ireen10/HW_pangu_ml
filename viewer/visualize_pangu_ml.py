@@ -900,7 +900,8 @@ def main() -> None:
 
     root_input = st.text_input(
         "输入 pangu_ml 数据根路径",
-        placeholder="例如: E:/data/pangu_ml_dataset",
+        value="/home/ma-user/work/preliminary_grounding/z00848098/data/pangu_ml/JoyAI-Image-OpenSpatial",
+        placeholder="例如: E:/data/pangu_ml_dataset 或上述默认路径",
     )
 
     if not root_input:
