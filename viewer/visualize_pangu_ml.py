@@ -451,12 +451,25 @@ def render_resolution_stats_section(
         df_h = pd.DataFrame(hm_rows)
         n_src = df_h["source"].nunique()
         src_order = [str(s) for s, _ in ranked]
+        # Vega-Lite defaults to hiding Y labels that would overlap — with many sources
+        # only ~few ticks appear. labelOverlap=False forces every row label.
+        row_px = 32
         ch = (
             alt.Chart(df_h)
             .mark_rect()
             .encode(
                 x=alt.X("bucket:N", sort=mp_order, title="Megapixel 分桶"),
-                y=alt.Y("source:N", title="data_source", sort=src_order),
+                y=alt.Y(
+                    "source:N",
+                    title="data_source",
+                    sort=src_order,
+                    axis=alt.Axis(
+                        labelOverlap=False,
+                        labelFontSize=10,
+                        labelLimit=0,
+                        labelPadding=4,
+                    ),
+                ),
                 color=alt.Color(
                     "count:Q",
                     scale=alt.Scale(scheme="blues"),
@@ -470,10 +483,11 @@ def render_resolution_stats_section(
                 ],
             )
             .properties(
-                height=min(560, 24 * n_src + 100),
+                height=min(900, row_px * n_src + 120),
                 title=f"各来源 × Megapixel（前 {len(ranked)} 个来源，按图像数）",
             )
         )
+        st.caption("纵轴已设为显示全部来源；图变高时可滚动页面查看。")
         st.altair_chart(ch, use_container_width=True)
 
     with st.expander("各来源宽高范围（min/max）"):
