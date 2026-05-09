@@ -78,6 +78,63 @@ def total_samples(shards: List[Dict[str, Any]]) -> int:
     return sum(int(s["line_count"]) for s in shards)
 
 
+def normalize_data_source(value: Any) -> str:
+    """Align with convert_to_pangu_ml.normalize_data_source."""
+    raw = str(value or "unknown_source").strip()
+    s = raw.lower().replace("_", "-").replace(" ", "")
+    if s in ("matterport3d", "matterpod3d", "matterpot3d"):
+        return "matterport3d"
+    if s in ("egoexo4d", "ego-exo4d"):
+        return "Ego-Exo4D"
+    return raw or "unknown_source"
+
+
+def data_source_from_sample_id(sample_id: Any) -> str:
+    """Sample id format: `{data_source}__{raw_id}` from convert_to_pangu_ml."""
+    s = str(sample_id or "")
+    if "__" in s:
+        return s.split("__", 1)[0]
+    return "unknown_source"
+
+
+def _image_count_from_sample(obj: Dict[str, Any]) -> int:
+    """Same rule as extract_image_entries (duplicated to avoid import order issues)."""
+    data = obj.get("data") or []
+    if not data or not isinstance(data[0], dict):
+        return 0
+    if data[0].get("role") != "user":
+        return 0
+    n = 0
+    for part in data[0].get("content") or []:
+        if isinstance(part, dict) and part.get("type") == "image":
+            n += 1
+    return n
+
+
+def _sample_matches_filters(
+    obj: Dict[str, Any],
+    *,
+    category: str,
+    data_source: str,
+    image_filter: str,
+) -> bool:
+    """image_filter: '' | 'single' (exactly 1 image) | 'multi' (2+)."""
+    if category and str(obj.get("category") or "") != category:
+        return False
+    if data_source:
+        ds = normalize_data_source(data_source_from_sample_id(obj.get("id")))
+        if ds != normalize_data_source(data_source):
+            return False
+    nimg = _image_count_from_sample(obj)
+    if image_filter == "single":
+        if nimg != 1:
+            return False
+    elif image_filter == "multi":
+        if nimg <= 1:
+            return False
+    return True
+
+
 def _distribution_items(dist: Any) -> List[Tuple[str, int]]:
     """Parse metadata.json *distribution dicts: { key: { count, ratio } }."""
     if not isinstance(dist, dict):
@@ -269,29 +326,20 @@ def render_metadata_distribution_section(meta: Optional[Dict[str, Any]], *, pie_
         st.caption("无 image_count 分布数据")
 
 
-def _category_of_json_line(line: str) -> str:
-    obj = json.loads(line)
-    raw = obj.get("category")
-    return "" if raw is None else str(raw)
-
-
-def _ensure_category_matches_cached(
+def _ensure_filter_matches_cached(
     *,
     root_path: str,
     shards: List[Dict[str, Any]],
     category: str,
+    data_source: str,
+    image_filter: str,
     need_upto_match_index: int,
 ) -> Tuple[List[int], bool]:
     """
-    Low-memory category filtering.
-
-    IMPORTANT: do NOT build a full category->indices map for huge datasets.
-    A 2.4M-row dataset would store ~2.4M integers (plus Python list overhead), easily hundreds of MB+.
-
-    Instead we scan forward incrementally and cache only the matches we've needed so far.
-    Returns (matches, exhausted).
+    Low-memory combined filter (category + data_source + single/multi image).
+    Scans jsonl incrementally; cache key includes all filter dimensions.
     """
-    key = f"cat_cache::{root_path}::{category}"
+    key = f"filter_cache::{root_path}::{category}::{data_source}::{image_filter}"
     state = st.session_state.get(key)
     if not isinstance(state, dict):
         state = {"matches": [], "shard_pos": 0, "line_pos": 0, "exhausted": False}
@@ -304,7 +352,6 @@ def _ensure_category_matches_cached(
     if need_upto_match_index < 0:
         need_upto_match_index = 0
 
-    # Safety valve: cap cached match indices to keep memory bounded.
     MAX_CACHED_MATCHES = 200_000
 
     shard_pos = int(state["shard_pos"])
@@ -322,16 +369,24 @@ def _ensure_category_matches_cached(
                 if not line:
                     continue
                 try:
-                    cat = _category_of_json_line(line)
+                    obj = json.loads(line)
+                    if not isinstance(obj, dict):
+                        continue
                 except Exception:
                     continue
-                if cat == category:
-                    matches.append(start_index + i)
-                    if len(matches) >= MAX_CACHED_MATCHES:
-                        state["exhausted"] = True
-                        state["shard_pos"] = shard_pos
-                        state["line_pos"] = i + 1
-                        return matches, True
+                if not _sample_matches_filters(
+                    obj,
+                    category=category,
+                    data_source=data_source,
+                    image_filter=image_filter,
+                ):
+                    continue
+                matches.append(start_index + i)
+                if len(matches) >= MAX_CACHED_MATCHES:
+                    state["exhausted"] = True
+                    state["shard_pos"] = shard_pos
+                    state["line_pos"] = i + 1
+                    return matches, True
                 if len(matches) > need_upto_match_index:
                     state["shard_pos"] = shard_pos
                     state["line_pos"] = i + 1
@@ -877,10 +932,14 @@ def main() -> None:
     page_size = 2
     st.markdown("### 筛选（低内存）")
     cat_dist: Dict[str, Any] = {}
+    src_dist: Dict[str, Any] = {}
     if isinstance(meta, dict):
         raw_dist = meta.get("category_distribution")
         if isinstance(raw_dist, dict):
             cat_dist = raw_dist
+        raw_src = meta.get("data_source_distribution")
+        if isinstance(raw_src, dict):
+            src_dist = raw_src
 
     # Build dropdown options from metadata (no jsonl scan, low memory).
     dropdown_labels: List[str] = ["(全部)"]
@@ -913,8 +972,51 @@ def main() -> None:
             placeholder="例如: grounding_3d.single_view",
         ).strip()
 
-    if not category_input:
-        st.caption("当前筛选: 全部")
+    ds_dropdown_labels: List[str] = ["(全部)"]
+    ds_dropdown_to_value: Dict[str, str] = {"(全部)": ""}
+    if src_dist:
+        for src, info in sorted(
+            src_dist.items(),
+            key=lambda kv: int(kv[1].get("count", 0)) if isinstance(kv[1], dict) else 0,
+            reverse=True,
+        ):
+            count = int(info.get("count", 0)) if isinstance(info, dict) else 0
+            label = f"{src}  ({count})"
+            ds_dropdown_labels.append(label)
+            ds_dropdown_to_value[label] = str(src)
+
+    if src_dist:
+        ds_selected = st.selectbox(
+            "按 data_source 筛选（来自 metadata.json，与样本 id 前缀一致）",
+            ds_dropdown_labels,
+            index=0,
+        )
+        data_source_input = ds_dropdown_to_value.get(ds_selected, "")
+        with st.expander("高级：手动输入 data_source"):
+            ds_manual = st.text_input(
+                "手动输入（留空则使用下拉）",
+                placeholder="例如: matterport3d",
+                key="ds_manual_input",
+            ).strip()
+            if ds_manual:
+                data_source_input = ds_manual
+    else:
+        st.caption("未找到 `data_source_distribution`，可手动输入来源（与 id 中 `来源__` 前缀一致，含错别字会按转换脚本规则归一）。")
+        data_source_input = st.text_input("按 data_source 筛选（留空=全部）", "").strip()
+
+    image_filter_label = st.radio(
+        "按图片数量",
+        ("全部", "单图（1 张）", "多图（≥2 张）"),
+        horizontal=True,
+        key="image_filter_radio",
+    )
+    image_filter_map = {"全部": "", "单图（1 张）": "single", "多图（≥2 张）": "multi"}
+    image_filter = image_filter_map[image_filter_label]
+
+    use_stream_scan = bool(category_input or data_source_input or image_filter)
+
+    if not use_stream_scan:
+        st.caption("当前筛选: 全部（顺序翻页）")
         total_pages = (n + page_size - 1) // page_size
         page = int(st.number_input("页码", min_value=1, max_value=total_pages, value=1, step=1))
         start = (page - 1) * page_size
@@ -922,7 +1024,16 @@ def main() -> None:
         slot_b = start + 1 if start + 1 < n else None
         page_key = str(page)
     else:
-        st.caption(f"当前筛选: category == `{category_input}`（流式扫描，避免一次性读入索引）")
+        parts: List[str] = []
+        if category_input:
+            parts.append(f"category=`{category_input}`")
+        if data_source_input:
+            parts.append(f"data_source=`{normalize_data_source(data_source_input)}`")
+        if image_filter == "single":
+            parts.append("图片=单图")
+        elif image_filter == "multi":
+            parts.append("图片=多图")
+        st.caption("当前筛选: " + "，".join(parts) + "（流式扫描 jsonl，不建全量索引）")
         match_offset = int(
             st.number_input(
                 "匹配偏移（0 表示第 1 个匹配样本）",
@@ -932,10 +1043,12 @@ def main() -> None:
             )
         )
         need_upto = match_offset + (page_size - 1)
-        matches, exhausted = _ensure_category_matches_cached(
+        matches, exhausted = _ensure_filter_matches_cached(
             root_path=root_input,
             shards=shards,
             category=category_input,
+            data_source=normalize_data_source(data_source_input) if data_source_input else "",
+            image_filter=image_filter,
             need_upto_match_index=need_upto,
         )
         slot_a = matches[match_offset] if match_offset < len(matches) else None
