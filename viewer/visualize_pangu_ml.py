@@ -78,6 +78,122 @@ def total_samples(shards: List[Dict[str, Any]]) -> int:
     return sum(int(s["line_count"]) for s in shards)
 
 
+def _distribution_items(dist: Any) -> List[Tuple[str, int]]:
+    """Parse metadata.json *distribution dicts: { key: { count, ratio } }."""
+    if not isinstance(dist, dict):
+        return []
+    out: List[Tuple[str, int]] = []
+    for k, v in dist.items():
+        if isinstance(v, dict) and "count" in v:
+            try:
+                out.append((str(k), int(v["count"])))
+            except (TypeError, ValueError):
+                continue
+    return out
+
+
+def render_metadata_distribution_section(meta: Optional[Dict[str, Any]], *, pie_top_n: int = 18) -> None:
+    """
+    Category & data_source: pie charts (top slices + 其他).
+    Image count: bar chart (all keys, sorted by image count).
+    """
+    if not meta:
+        st.info("未找到 `metadata.json`，无法展示与转换脚本一致的分布统计。")
+        return
+
+    cat_items = _distribution_items(meta.get("category_distribution"))
+    src_items = _distribution_items(meta.get("data_source_distribution"))
+    img_items = _distribution_items(meta.get("image_count_distribution"))
+
+    if not cat_items and not src_items and not img_items:
+        st.caption("metadata.json 中缺少 `category_distribution` / `data_source_distribution` / `image_count_distribution`。")
+        return
+
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        st.warning("安装 **matplotlib** 后可在此页查看分布图：`pip install matplotlib`")
+        return
+
+    def _pie_figure(title: str, items: List[Tuple[str, int]]) -> Any:
+        items = sorted(items, key=lambda x: -x[1])
+        if not items:
+            return None
+        max_slices = max(3, int(pie_top_n))
+        if len(items) > max_slices:
+            head = items[: max_slices - 1]
+            rest = sum(c for _, c in items[max_slices - 1 :])
+            if rest > 0:
+                head.append(("其他", rest))
+            items = head
+        labels = [lbl[:48] + ("…" if len(lbl) > 48 else "") for lbl, _ in items]
+        sizes = [c for _, c in items]
+        fig, ax = plt.subplots(figsize=(7, 5.5))
+        ax.pie(
+            sizes,
+            labels=labels,
+            autopct=lambda p: f"{p:.1f}%" if p >= 1.5 else "",
+            pctdistance=0.75,
+            textprops={"fontsize": 8},
+        )
+        ax.set_title(title, fontsize=12)
+        fig.tight_layout()
+        return fig
+
+    def _bar_image_count_figure(items: List[Tuple[str, int]]) -> Any:
+        pairs: List[Tuple[int, int]] = []
+        for k, c in items:
+            try:
+                pairs.append((int(k), c))
+            except ValueError:
+                continue
+        pairs.sort(key=lambda x: x[0])
+        if not pairs:
+            return None
+        xs = [str(p[0]) for p in pairs]
+        ys = [p[1] for p in pairs]
+        fig, ax = plt.subplots(figsize=(max(8.0, 0.45 * len(xs) + 2), 5))
+        ax.bar(range(len(xs)), ys, color="steelblue")
+        ax.set_xticks(range(len(xs)))
+        ax.set_xticklabels(xs, rotation=0)
+        ax.set_xlabel("图像数量（张）")
+        ax.set_ylabel("样本数")
+        ax.set_title("各图像数量样本分布")
+        ax.grid(axis="y", linestyle="--", alpha=0.35)
+        fig.tight_layout()
+        return fig
+
+    st.markdown("#### 数据分布（metadata.json）")
+    c1, c2 = st.columns(2)
+    with c1:
+        if cat_items:
+            fig = _pie_figure("Category", cat_items)
+            if fig is not None:
+                st.pyplot(fig)
+                plt.close(fig)
+        else:
+            st.caption("无 category 分布数据")
+    with c2:
+        if src_items:
+            fig = _pie_figure("数据来源", src_items)
+            if fig is not None:
+                st.pyplot(fig)
+                plt.close(fig)
+        else:
+            st.caption("无 data_source 分布数据")
+
+    if img_items:
+        fig = _bar_image_count_figure(img_items)
+        if fig is not None:
+            st.pyplot(fig)
+            plt.close(fig)
+    else:
+        st.caption("无 image_count 分布数据")
+
+
 def _category_of_json_line(line: str) -> str:
     obj = json.loads(line)
     raw = obj.get("category")
@@ -671,9 +787,20 @@ def main() -> None:
     if n == 0:
         return
 
+    meta = read_dataset_metadata(root_input)
+    with st.expander("数据分布（与 convert_to_pangu_ml 统计一致）", expanded=False):
+        pie_top = st.number_input(
+            "饼图最多显示扇区数（其余合并为「其他」）",
+            min_value=5,
+            max_value=40,
+            value=18,
+            step=1,
+            key="dist_pie_top_n",
+        )
+        render_metadata_distribution_section(meta, pie_top_n=int(pie_top))
+
     page_size = 2
     st.markdown("### 筛选（低内存）")
-    meta = read_dataset_metadata(root_input)
     cat_dist: Dict[str, Any] = {}
     if isinstance(meta, dict):
         raw_dist = meta.get("category_distribution")
