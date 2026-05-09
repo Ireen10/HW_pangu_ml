@@ -132,6 +132,8 @@ def render_metadata_distribution_section(meta: Optional[Dict[str, Any]], *, pie_
         return
 
     CHART_H = 260
+    PIE_OUTER = 112
+    PIE_OUTER_HOVER = 128
 
     def _pie_altair(items: List[Tuple[str, int]], title: str) -> Any:
         collapsed = _collapse_top_n(items, pie_top_n)
@@ -143,15 +145,29 @@ def render_metadata_distribution_section(meta: Optional[Dict[str, Any]], *, pie_
         df = pd.DataFrame(rows)
         total = int(df["count"].sum())
         df["percent"] = df["count"] / total if total else 0.0
+        hover = alt.selection_point(
+            on="mouseover",
+            clear="mouseout",
+            fields=["label"],
+            empty=False,
+        )
         return (
             alt.Chart(df)
-            .mark_arc(innerRadius=48)
+            .mark_arc(
+                innerRadius=52,
+                padAngle=0.012,
+                cornerRadius=3,
+            )
             .encode(
                 theta=alt.Theta("count:Q", stack=True),
+                radius=alt.condition(hover, alt.value(PIE_OUTER_HOVER), alt.value(PIE_OUTER)),
                 color=alt.Color(
                     "label:N",
                     legend=alt.Legend(title=None, orient="right", labelLimit=100, labelFontSize=10),
                 ),
+                opacity=alt.condition(hover, alt.value(1), alt.value(0.88)),
+                stroke=alt.condition(hover, alt.value("#f8fafc"), alt.value("#ffffff")),
+                strokeWidth=alt.condition(hover, alt.value(3), alt.value(0.6)),
                 tooltip=[
                     alt.Tooltip("label:N", title="类别"),
                     alt.Tooltip("count:Q", title="数量", format=","),
@@ -159,6 +175,8 @@ def render_metadata_distribution_section(meta: Optional[Dict[str, Any]], *, pie_
                 ],
             )
             .properties(height=CHART_H, title=title)
+            .add_params(hover)
+            .configure_view(strokeWidth=0)
         )
 
     def _bar_images_altair(items: List[Tuple[str, int]]) -> Any:
@@ -182,12 +200,34 @@ def render_metadata_distribution_section(meta: Optional[Dict[str, Any]], *, pie_
                 }
             )
         df = pd.DataFrame(rows)
+        df = df[df["count"] > 0]
+        if df.empty:
+            return None
+        hover = alt.selection_point(
+            on="mouseover",
+            clear="mouseout",
+            fields=["n_images"],
+            empty=False,
+        )
+        y_min = max(1, int(df["count"].min()))
+        y_max = int(df["count"].max())
+        if y_max <= y_min:
+            y_max = y_min * 10
         return (
             alt.Chart(df)
-            .mark_bar(color="#4C78A8")
+            .mark_bar(cornerRadiusEnd=3)
             .encode(
                 x=alt.X("n_images:N", title="图像数量（张）", sort=None),
-                y=alt.Y("count:Q", title="样本数"),
+                y=alt.Y(
+                    "count:Q",
+                    title="样本数（log₁₀）",
+                    scale=alt.Scale(type="log", base=10, domain=[y_min, y_max], nice=True, clamp=True),
+                ),
+                color=alt.condition(hover, alt.value("#5B9BD5"), alt.value("#4C78A8")),
+                size=alt.condition(hover, alt.value(34), alt.value(26)),
+                stroke=alt.condition(hover, alt.value("#1a2f4a"), alt.value("transparent")),
+                strokeWidth=alt.condition(hover, alt.value(2), alt.value(0)),
+                opacity=alt.condition(hover, alt.value(1), alt.value(0.92)),
                 tooltip=[
                     alt.Tooltip("n_images:N", title="张数"),
                     alt.Tooltip("count:Q", title="数量", format=","),
@@ -195,10 +235,12 @@ def render_metadata_distribution_section(meta: Optional[Dict[str, Any]], *, pie_
                 ],
             )
             .properties(height=CHART_H + 20, title="各图像数量样本分布")
+            .add_params(hover)
+            .configure_view(strokeWidth=0)
         )
 
     st.markdown("#### 数据分布（metadata.json）")
-    st.caption("鼠标悬停扇区或柱子上可查看数量与占比。")
+    st.caption("悬停扇区或柱子：高亮并略「浮起」；柱图为对数纵轴，便于看清小样本。")
     c1, c2 = st.columns(2)
     with c1:
         if cat_items:
