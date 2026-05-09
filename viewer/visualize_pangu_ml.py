@@ -92,10 +92,25 @@ def _distribution_items(dist: Any) -> List[Tuple[str, int]]:
     return out
 
 
+def _collapse_top_n(items: List[Tuple[str, int]], pie_top_n: int) -> List[Tuple[str, int]]:
+    items = sorted(items, key=lambda x: -x[1])
+    if not items:
+        return []
+    max_slices = max(3, int(pie_top_n))
+    if len(items) <= max_slices:
+        return items
+    head = items[: max_slices - 1]
+    rest = sum(c for _, c in items[max_slices - 1 :])
+    if rest > 0:
+        head.append(("其他", rest))
+    return head
+
+
 def render_metadata_distribution_section(meta: Optional[Dict[str, Any]], *, pie_top_n: int = 18) -> None:
     """
-    Category & data_source: pie charts (top slices + 其他).
-    Image count: bar chart (all keys, sorted by image count).
+    Interactive charts via Altair + st.altair_chart (hover: count & share).
+    Category & data_source: donut pies (top slices + 其他).
+    Image count: bar chart.
     """
     if not meta:
         st.info("未找到 `metadata.json`，无法展示与转换脚本一致的分布统计。")
@@ -110,40 +125,43 @@ def render_metadata_distribution_section(meta: Optional[Dict[str, Any]], *, pie_
         return
 
     try:
-        import matplotlib
-
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
+        import altair as alt
+        import pandas as pd
     except ImportError:
-        st.warning("安装 **matplotlib** 后可在此页查看分布图：`pip install matplotlib`")
+        st.warning("需要 **altair** 与 **pandas**（通常随 streamlit 已安装）。可执行：`pip install altair pandas`")
         return
 
-    def _pie_figure(title: str, items: List[Tuple[str, int]]) -> Any:
-        items = sorted(items, key=lambda x: -x[1])
-        if not items:
-            return None
-        max_slices = max(3, int(pie_top_n))
-        if len(items) > max_slices:
-            head = items[: max_slices - 1]
-            rest = sum(c for _, c in items[max_slices - 1 :])
-            if rest > 0:
-                head.append(("其他", rest))
-            items = head
-        labels = [lbl[:48] + ("…" if len(lbl) > 48 else "") for lbl, _ in items]
-        sizes = [c for _, c in items]
-        fig, ax = plt.subplots(figsize=(7, 5.5))
-        ax.pie(
-            sizes,
-            labels=labels,
-            autopct=lambda p: f"{p:.1f}%" if p >= 1.5 else "",
-            pctdistance=0.75,
-            textprops={"fontsize": 8},
-        )
-        ax.set_title(title, fontsize=12)
-        fig.tight_layout()
-        return fig
+    CHART_H = 260
 
-    def _bar_image_count_figure(items: List[Tuple[str, int]]) -> Any:
+    def _pie_altair(items: List[Tuple[str, int]], title: str) -> Any:
+        collapsed = _collapse_top_n(items, pie_top_n)
+        if not collapsed:
+            return None
+        rows = []
+        for lbl, cnt in collapsed:
+            rows.append({"label": str(lbl), "count": int(cnt)})
+        df = pd.DataFrame(rows)
+        total = int(df["count"].sum())
+        df["percent"] = df["count"] / total if total else 0.0
+        return (
+            alt.Chart(df)
+            .mark_arc(innerRadius=48)
+            .encode(
+                theta=alt.Theta("count:Q", stack=True),
+                color=alt.Color(
+                    "label:N",
+                    legend=alt.Legend(title=None, orient="right", labelLimit=100, labelFontSize=10),
+                ),
+                tooltip=[
+                    alt.Tooltip("label:N", title="类别"),
+                    alt.Tooltip("count:Q", title="数量", format=","),
+                    alt.Tooltip("percent:Q", title="占比", format=".2%"),
+                ],
+            )
+            .properties(height=CHART_H, title=title)
+        )
+
+    def _bar_images_altair(items: List[Tuple[str, int]]) -> Any:
         pairs: List[Tuple[int, int]] = []
         for k, c in items:
             try:
@@ -153,43 +171,54 @@ def render_metadata_distribution_section(meta: Optional[Dict[str, Any]], *, pie_
         pairs.sort(key=lambda x: x[0])
         if not pairs:
             return None
-        xs = [str(p[0]) for p in pairs]
-        ys = [p[1] for p in pairs]
-        fig, ax = plt.subplots(figsize=(max(8.0, 0.45 * len(xs) + 2), 5))
-        ax.bar(range(len(xs)), ys, color="steelblue")
-        ax.set_xticks(range(len(xs)))
-        ax.set_xticklabels(xs, rotation=0)
-        ax.set_xlabel("图像数量（张）")
-        ax.set_ylabel("样本数")
-        ax.set_title("各图像数量样本分布")
-        ax.grid(axis="y", linestyle="--", alpha=0.35)
-        fig.tight_layout()
-        return fig
+        total = sum(c for _, c in pairs)
+        rows = []
+        for n_img, cnt in pairs:
+            rows.append(
+                {
+                    "n_images": str(n_img),
+                    "count": int(cnt),
+                    "percent": (cnt / total) if total else 0.0,
+                }
+            )
+        df = pd.DataFrame(rows)
+        return (
+            alt.Chart(df)
+            .mark_bar(color="#4C78A8")
+            .encode(
+                x=alt.X("n_images:N", title="图像数量（张）", sort=None),
+                y=alt.Y("count:Q", title="样本数"),
+                tooltip=[
+                    alt.Tooltip("n_images:N", title="张数"),
+                    alt.Tooltip("count:Q", title="数量", format=","),
+                    alt.Tooltip("percent:Q", title="占比", format=".2%"),
+                ],
+            )
+            .properties(height=CHART_H + 20, title="各图像数量样本分布")
+        )
 
     st.markdown("#### 数据分布（metadata.json）")
+    st.caption("鼠标悬停扇区或柱子上可查看数量与占比。")
     c1, c2 = st.columns(2)
     with c1:
         if cat_items:
-            fig = _pie_figure("Category", cat_items)
-            if fig is not None:
-                st.pyplot(fig)
-                plt.close(fig)
+            ch = _pie_altair(cat_items, "Category")
+            if ch is not None:
+                st.altair_chart(ch, use_container_width=True)
         else:
             st.caption("无 category 分布数据")
     with c2:
         if src_items:
-            fig = _pie_figure("数据来源", src_items)
-            if fig is not None:
-                st.pyplot(fig)
-                plt.close(fig)
+            ch = _pie_altair(src_items, "数据来源")
+            if ch is not None:
+                st.altair_chart(ch, use_container_width=True)
         else:
             st.caption("无 data_source 分布数据")
 
     if img_items:
-        fig = _bar_image_count_figure(img_items)
-        if fig is not None:
-            st.pyplot(fig)
-            plt.close(fig)
+        ch = _bar_images_altair(img_items)
+        if ch is not None:
+            st.altair_chart(ch, use_container_width=True)
     else:
         st.caption("无 image_count 分布数据")
 
