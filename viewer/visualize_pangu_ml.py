@@ -151,6 +151,8 @@ def render_metadata_distribution_section(meta: Optional[Dict[str, Any]], *, pie_
             fields=["label"],
             empty=False,
         )
+        # Altair 6: alt.condition(...) on some channels (e.g. radius) is rejected by the
+        # schema; use when/then/otherwise for interactive ValueDefs.
         return (
             alt.Chart(df)
             .mark_arc(
@@ -160,14 +162,18 @@ def render_metadata_distribution_section(meta: Optional[Dict[str, Any]], *, pie_
             )
             .encode(
                 theta=alt.Theta("count:Q", stack=True),
-                radius=alt.condition(hover, alt.value(PIE_OUTER_HOVER), alt.value(PIE_OUTER)),
+                radius=alt.when(hover)
+                .then(alt.value(PIE_OUTER_HOVER))
+                .otherwise(alt.value(PIE_OUTER)),
                 color=alt.Color(
                     "label:N",
                     legend=alt.Legend(title=None, orient="right", labelLimit=100, labelFontSize=10),
                 ),
-                opacity=alt.condition(hover, alt.value(1), alt.value(0.88)),
-                stroke=alt.condition(hover, alt.value("#f8fafc"), alt.value("#ffffff")),
-                strokeWidth=alt.condition(hover, alt.value(3), alt.value(0.6)),
+                opacity=alt.when(hover).then(alt.value(1)).otherwise(alt.value(0.88)),
+                stroke=alt.when(hover)
+                .then(alt.value("#f8fafc"))
+                .otherwise(alt.value("#ffffff")),
+                strokeWidth=alt.when(hover).then(alt.value(3)).otherwise(alt.value(0.6)),
                 tooltip=[
                     alt.Tooltip("label:N", title="类别"),
                     alt.Tooltip("count:Q", title="数量", format=","),
@@ -223,11 +229,15 @@ def render_metadata_distribution_section(meta: Optional[Dict[str, Any]], *, pie_
                     title="样本数（log₁₀）",
                     scale=alt.Scale(type="log", base=10, domain=[y_min, y_max], nice=True, clamp=True),
                 ),
-                color=alt.condition(hover, alt.value("#5B9BD5"), alt.value("#4C78A8")),
-                size=alt.condition(hover, alt.value(34), alt.value(26)),
-                stroke=alt.condition(hover, alt.value("#1a2f4a"), alt.value("transparent")),
-                strokeWidth=alt.condition(hover, alt.value(2), alt.value(0)),
-                opacity=alt.condition(hover, alt.value(1), alt.value(0.92)),
+                color=alt.when(hover)
+                .then(alt.value("#5B9BD5"))
+                .otherwise(alt.value("#4C78A8")),
+                size=alt.when(hover).then(alt.value(34)).otherwise(alt.value(26)),
+                stroke=alt.when(hover)
+                .then(alt.value("#1a2f4a"))
+                .otherwise(alt.value("transparent")),
+                strokeWidth=alt.when(hover).then(alt.value(2)).otherwise(alt.value(0)),
+                opacity=alt.when(hover).then(alt.value(1)).otherwise(alt.value(0.92)),
                 tooltip=[
                     alt.Tooltip("n_images:N", title="张数"),
                     alt.Tooltip("count:Q", title="数量", format=","),
