@@ -1116,7 +1116,7 @@ def main() -> None:
     with st.expander("图像分辨率（resolution_stats）", expanded=False):
         render_resolution_stats_section(meta, heatmap_top_sources=16)
 
-    page_size = 2
+    page_size = 10
     st.markdown("### 筛选（低内存）")
     cat_dist: Dict[str, Any] = {}
     src_dist: Dict[str, Any] = {}
@@ -1202,14 +1202,75 @@ def main() -> None:
 
     use_stream_scan = bool(category_input or data_source_input or image_filter)
 
+    # Reset paging when switching between full scan vs filtered scan.
+    prev_mode = st.session_state.get("_pangu_browse_stream")
+    if prev_mode is not None and bool(prev_mode) != use_stream_scan:
+        st.session_state.pop("pangu_seq_page", None)
+        st.session_state.pop("pangu_stream_off", None)
+    st.session_state["_pangu_browse_stream"] = use_stream_scan
+
+    st.markdown("### 样本浏览")
+    indices: List[Optional[int]] = []
+    page_key = "0"
+    exhausted = False
+
     if not use_stream_scan:
         st.caption("当前筛选: 全部（顺序翻页）")
-        total_pages = (n + page_size - 1) // page_size
-        page = int(st.number_input("页码", min_value=1, max_value=total_pages, value=1, step=1))
+        total_pages = max(1, (n + page_size - 1) // page_size)
+        if "pangu_seq_page" not in st.session_state:
+            st.session_state.pangu_seq_page = 1
+        st.session_state.pangu_seq_page = max(
+            1, min(int(st.session_state.pangu_seq_page), total_pages)
+        )
+
+        def _seq_pagination_row(which: str) -> None:
+            c1, c2, c3 = st.columns([1, 3, 1])
+            with c1:
+                if st.button(
+                    "◀ 上一页",
+                    key=f"pangu_seq_prev_{which}",
+                    disabled=st.session_state.pangu_seq_page <= 1,
+                ):
+                    st.session_state.pangu_seq_page -= 1
+                    st.rerun()
+            with c2:
+                if which == "top":
+                    new_p = st.number_input(
+                        "页码",
+                        min_value=1,
+                        max_value=total_pages,
+                        value=int(st.session_state.pangu_seq_page),
+                        step=1,
+                        key="pangu_seq_page_input",
+                    )
+                    if new_p != st.session_state.pangu_seq_page:
+                        st.session_state.pangu_seq_page = new_p
+                        st.rerun()
+                else:
+                    st.caption(
+                        f"当前页 **{int(st.session_state.pangu_seq_page)}** / **{total_pages}** "
+                        f"（在上方修改页码，或使用两侧按钮）"
+                    )
+            with c3:
+                if st.button(
+                    "下一页 ▶",
+                    key=f"pangu_seq_next_{which}",
+                    disabled=st.session_state.pangu_seq_page >= total_pages,
+                ):
+                    st.session_state.pangu_seq_page += 1
+                    st.rerun()
+            if which == "top":
+                st.caption(
+                    f"第 **{int(st.session_state.pangu_seq_page)}** / **{total_pages}** 页 · "
+                    f"每页 **{page_size}** 条 · 全局 **{n}** 条"
+                )
+
+        _seq_pagination_row("top")
+        page = int(st.session_state.pangu_seq_page)
         start = (page - 1) * page_size
-        slot_a = start if start < n else None
-        slot_b = start + 1 if start + 1 < n else None
+        indices = [start + i if start + i < n else None for i in range(page_size)]
         page_key = str(page)
+        st.divider()
     else:
         parts: List[str] = []
         if category_input:
@@ -1221,14 +1282,54 @@ def main() -> None:
         elif image_filter == "multi":
             parts.append("图片=多图")
         st.caption("当前筛选: " + "，".join(parts) + "（流式扫描 jsonl，不建全量索引）")
-        match_offset = int(
-            st.number_input(
-                "匹配偏移（0 表示第 1 个匹配样本）",
-                min_value=0,
-                value=0,
-                step=page_size,
-            )
-        )
+        if "pangu_stream_off" not in st.session_state:
+            st.session_state.pangu_stream_off = 0
+        st.session_state.pangu_stream_off = max(0, int(st.session_state.pangu_stream_off))
+
+        def _stream_pagination_row(which: str) -> None:
+            c1, c2, c3 = st.columns([1, 3, 1])
+            with c1:
+                if st.button(
+                    "◀ 上一批",
+                    key=f"pangu_str_prev_{which}",
+                    disabled=st.session_state.pangu_stream_off <= 0,
+                ):
+                    st.session_state.pangu_stream_off = max(
+                        0, int(st.session_state.pangu_stream_off) - page_size
+                    )
+                    st.rerun()
+            with c2:
+                if which == "top":
+                    new_off = st.number_input(
+                        "匹配起始偏移（第 1 条匹配为 0；步长与每页条数一致）",
+                        min_value=0,
+                        value=int(st.session_state.pangu_stream_off),
+                        step=page_size,
+                        key="pangu_stream_off_input",
+                    )
+                    if new_off != st.session_state.pangu_stream_off:
+                        st.session_state.pangu_stream_off = new_off
+                        st.rerun()
+                else:
+                    st.caption(
+                        f"当前匹配偏移 **{int(st.session_state.pangu_stream_off)}** "
+                        f"（在上方修改，或使用两侧按钮按 ±{page_size} 翻页）"
+                    )
+            with c3:
+                if st.button(
+                    "下一批 ▶",
+                    key=f"pangu_str_next_{which}",
+                ):
+                    st.session_state.pangu_stream_off = int(st.session_state.pangu_stream_off) + page_size
+                    st.rerun()
+            if which == "top":
+                st.caption(
+                    f"从第 **{int(st.session_state.pangu_stream_off) + 1}** 条匹配起展示本页 "
+                    f"（每页 **{page_size}** 条）"
+                )
+
+        _stream_pagination_row("top")
+        match_offset = int(st.session_state.pangu_stream_off)
         need_upto = match_offset + (page_size - 1)
         matches, exhausted = _ensure_filter_matches_cached(
             root_path=root_input,
@@ -1238,24 +1339,41 @@ def main() -> None:
             image_filter=image_filter,
             need_upto_match_index=need_upto,
         )
-        slot_a = matches[match_offset] if match_offset < len(matches) else None
-        slot_b = matches[match_offset + 1] if match_offset + 1 < len(matches) else None
-        if slot_a is None and exhausted:
+        indices = [
+            matches[match_offset + i] if match_offset + i < len(matches) else None
+            for i in range(page_size)
+        ]
+        if indices[0] is None and exhausted:
             st.info("未找到更多匹配样本（已扫描到末尾或缓存已达上限）。")
         page_key = f"m{match_offset}"
+        st.divider()
 
-    left, right = st.columns(2)
-    for col, idx, slot in [(left, slot_a, "left"), (right, slot_b, "right")]:
-        with col:
-            if idx is None:
-                st.info("本页无更多样本")
-                continue
-            loaded = load_sample_by_global_index(shards, idx)
-            if loaded is None:
-                st.error(f"样本加载失败: index={idx}")
-                continue
-            sample, tar_path = loaded
-            render_sample_card(sample, tar_path, card_key=f"{page_key}_{slot}_{idx}")
+    for row in range((page_size + 1) // 2):
+        col_left, col_right = st.columns(2)
+        for col, j in ((col_left, 0), (col_right, 1)):
+            slot_idx = row * 2 + j
+            if slot_idx >= page_size:
+                break
+            idx = indices[slot_idx] if slot_idx < len(indices) else None
+            slot_name = f"s{slot_idx}"
+            with col:
+                if idx is None:
+                    st.info("本页无更多样本")
+                    continue
+                loaded = load_sample_by_global_index(shards, idx)
+                if loaded is None:
+                    st.error(f"样本加载失败: index={idx}")
+                    continue
+                sample, tar_path = loaded
+                render_sample_card(
+                    sample, tar_path, card_key=f"{page_key}_{slot_name}_{idx}"
+                )
+
+    st.divider()
+    if not use_stream_scan:
+        _seq_pagination_row("bottom")
+    else:
+        _stream_pagination_row("bottom")
 
 
 if __name__ == "__main__":
