@@ -1219,6 +1219,8 @@ def main() -> None:
         total_pages = max(1, (n + page_size - 1) // page_size)
         if "pangu_seq_page" not in st.session_state:
             st.session_state.pangu_seq_page = 1
+        # number_input must use the same session key as buttons update, otherwise the
+        # widget keeps stale `*_input` state and the next sync line overwrites button clicks.
         st.session_state.pangu_seq_page = max(
             1, min(int(st.session_state.pangu_seq_page), total_pages)
         )
@@ -1235,17 +1237,13 @@ def main() -> None:
                     st.rerun()
             with c2:
                 if which == "top":
-                    new_p = st.number_input(
+                    st.number_input(
                         "页码",
                         min_value=1,
                         max_value=total_pages,
-                        value=int(st.session_state.pangu_seq_page),
                         step=1,
-                        key="pangu_seq_page_input",
+                        key="pangu_seq_page",
                     )
-                    if new_p != st.session_state.pangu_seq_page:
-                        st.session_state.pangu_seq_page = new_p
-                        st.rerun()
                 else:
                     st.caption(
                         f"当前页 **{int(st.session_state.pangu_seq_page)}** / **{total_pages}** "
@@ -1300,16 +1298,12 @@ def main() -> None:
                     st.rerun()
             with c2:
                 if which == "top":
-                    new_off = st.number_input(
+                    st.number_input(
                         "匹配起始偏移（第 1 条匹配为 0；步长与每页条数一致）",
                         min_value=0,
-                        value=int(st.session_state.pangu_stream_off),
                         step=page_size,
-                        key="pangu_stream_off_input",
+                        key="pangu_stream_off",
                     )
-                    if new_off != st.session_state.pangu_stream_off:
-                        st.session_state.pangu_stream_off = new_off
-                        st.rerun()
                 else:
                     st.caption(
                         f"当前匹配偏移 **{int(st.session_state.pangu_stream_off)}** "
