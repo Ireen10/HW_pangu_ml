@@ -574,11 +574,88 @@ def strip_image_placeholder_tokens(text: str) -> str:
     # Keep original line breaks for downstream visualization.
     # We only remove the <image> placeholder and normalize spaces per line.
     text = IMAGE_TOKEN_RE.sub(" ", text)
+    return normalize_user_text_after_image_tokens_removed(text)
+
+
+def normalize_user_text_after_image_tokens_removed(text: str) -> str:
+    """Collapse whitespace per line; keep newlines (expects image tokens already removed)."""
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     normalized_lines = []
     for line in text.split("\n"):
         normalized_lines.append(re.sub(r"[ \t\f\v]+", " ", line).strip())
     return "\n".join(normalized_lines).strip()
+
+
+def _iter_first_user_placeholder_segments(text: str) -> List[Tuple[str, str]]:
+    """
+    Split first-user raw string by image placeholder tokens (order-preserving).
+
+    Returns a list of ("text", chunk) and ("slot", "") entries; each "slot" is one
+    placeholder occurrence (consumes one image in aligned mode).
+    """
+    out: List[Tuple[str, str]] = []
+    cursor = 0
+    for m in IMAGE_TOKEN_RE.finditer(text):
+        if m.start() > cursor:
+            out.append(("text", text[cursor : m.start()]))
+        out.append(("slot", ""))
+        cursor = m.end()
+    out.append(("text", text[cursor:]))
+    return out
+
+
+def _count_image_slots(segments: List[Tuple[str, str]]) -> int:
+    return sum(1 for kind, _ in segments if kind == "slot")
+
+
+def build_first_user_multimodal_content(
+    first_user_raw_text: str,
+    image_rows: List[Tuple[str, bytes, int, int]],
+) -> List[Dict[str, Any]]:
+    """
+    image_rows: (tar_relative_path, jpeg_bytes, width, height) per successfully decoded image.
+
+    If the text contains the same number of image placeholders as image_rows (>0),
+    emit image/text parts in placeholder order. Otherwise fall back to: all images
+    first, then one text block with all placeholders stripped.
+    """
+    n_img = len(image_rows)
+    segments = _iter_first_user_placeholder_segments(first_user_raw_text)
+    n_slot = _count_image_slots(segments)
+
+    def _image_part(idx: int) -> Dict[str, Any]:
+        rel, _b, w, h = image_rows[idx]
+        return {
+            "type": "image",
+            "image": {
+                "type": "relative_path",
+                "format": IMAGE_FORMAT,
+                "relative_path": rel,
+                "width": int(w),
+                "height": int(h),
+            },
+        }
+
+    content: List[Dict[str, Any]] = []
+    if n_img > 0 and n_slot > 0 and n_slot == n_img:
+        img_i = 0
+        for kind, chunk in segments:
+            if kind == "slot":
+                content.append(_image_part(img_i))
+                img_i += 1
+                continue
+            cleaned = strip_image_placeholder_tokens(chunk)
+            if cleaned:
+                content.append(to_text_content(cleaned))
+        return content
+
+    # Fallback: no placeholders, or count mismatch (treat as source bug).
+    for i in range(n_img):
+        content.append(_image_part(i))
+    tail = strip_image_placeholder_tokens(first_user_raw_text)
+    if tail:
+        content.append(to_text_content(tail))
+    return content
 
 
 def convert_to_jpeg_and_get_size(image_bytes: bytes) -> Tuple[bytes, int, int]:
@@ -645,7 +722,7 @@ def build_pangu_sample_parts(
         text_value = "" if value is None else str(normalize_scalar(value))
         turns.append({"role": role, "text": text_value})
 
-    first_user_content: List[Dict[str, Any]] = []
+    image_rows: List[Tuple[str, bytes, int, int]] = []
     tar_members: List[Tuple[str, bytes]] = []
     for img_idx, image_obj in enumerate(images):
         image_obj = normalize_scalar(image_obj)
@@ -657,29 +734,17 @@ def build_pangu_sample_parts(
         image_bytes, width, height = convert_to_jpeg_and_get_size(source_image_bytes)
         tar_relative_path = build_tar_relative_path(sample_id, img_idx)
         tar_members.append((tar_relative_path, image_bytes))
+        image_rows.append((tar_relative_path, image_bytes, int(width), int(height)))
 
-        first_user_content.append(
-            {
-                "type": "image",
-                "image": {
-                    "type": "relative_path",
-                    "format": IMAGE_FORMAT,
-                    "relative_path": tar_relative_path,
-                    "width": int(width),
-                    "height": int(height),
-                },
-            }
-        )
+    first_user_content = build_first_user_multimodal_content(turns[0]["text"], image_rows)
 
     data: List[Dict[str, Any]] = []
     for idx, turn in enumerate(turns):
-        content = []
+        content: List[Dict[str, Any]] = []
         if idx == 0:
             content.extend(first_user_content)
-        text_value = turn["text"]
-        if idx == 0:
-            text_value = strip_image_placeholder_tokens(text_value)
-        content.append(to_text_content(text_value))
+        else:
+            content.append(to_text_content(turn["text"]))
         data.append({"role": turn["role"], "content": content})
 
     sample = {"meta_prompt": [""], "data": data, "id": sample_id, "category": category}
