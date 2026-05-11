@@ -13,6 +13,9 @@ A row is flagged **deviant** iff:
 If placeholder count != image count, convert falls back to legacy layout → not flagged
 as deviant here (optional separate counter in summary).
 
+Scanning is silent; at the end prints whether any deviant exists, short counts, and
+one example (the first deviant in scan order, if any).
+
 Usage:
   python audit_placeholder_layout.py --parquet-dir /path/to/dir
   python audit_placeholder_layout.py --parquet-dir /path --max-rows 50000
@@ -21,7 +24,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pyarrow.parquet as pq
 
@@ -130,9 +133,10 @@ def main() -> None:
     deviants = 0
     mismatch = 0  # n_slot != n_img but both n_slot>0 or n_img>0 interesting
     no_ph = 0
+    first_example: Optional[Dict[str, Any]] = None
 
     remaining = args.max_rows
-    snippet_max = 200
+    snippet_max = 400
 
     for path in files:
         if remaining is not None and remaining <= 0:
@@ -156,33 +160,60 @@ def main() -> None:
 
             if info["deviates_from_all_images_first"]:
                 deviants += 1
-                sid = str(normalize_scalar(row.get("id") or ""))
-                ds = str(normalize_scalar(row.get("data_source") or ""))
-                snip = text.replace("\n", "\\n")
-                if len(snip) > snippet_max:
-                    snip = snip[:snippet_max] + "…"
-                flags = []
-                if info["has_nonws_before_first_placeholder"]:
-                    flags.append("leading_text")
-                if info["has_nonws_between_placeholders"]:
-                    flags.append("between_text")
-                print(
-                    f"[deviant] file={path.name} scan_row={total - 1} id={sid!r} "
-                    f"data_source={ds!r} n_ph={ns} n_img={n_img} "
-                    f"flags={','.join(flags)} text={snip!r}"
-                )
+                if first_example is None:
+                    sid = str(normalize_scalar(row.get("id") or ""))
+                    ds = str(normalize_scalar(row.get("data_source") or ""))
+                    snip = text.replace("\r\n", "\n").replace("\r", "\n")
+                    if len(snip) > snippet_max:
+                        snip = snip[:snippet_max] + "…"
+                    flags: List[str] = []
+                    if info["has_nonws_before_first_placeholder"]:
+                        flags.append("leading_text")
+                    if info["has_nonws_between_placeholders"]:
+                        flags.append("between_text")
+                    first_example = {
+                        "parquet_file": path.name,
+                        "scan_row": total - 1,
+                        "id": sid,
+                        "data_source": ds,
+                        "n_placeholder": ns,
+                        "n_image_decoded": n_img,
+                        "flags": flags,
+                        "first_human_text_preview": snip,
+                    }
 
     print("=== Placeholder layout audit ===")
     print(f"parquet_dir: {d}")
     print(f"files: {len(files)}  rows_scanned: {total}")
+    if deviants > 0:
+        print(
+            "结论: 源数据中存在「对齐分支下首条 human 含占位符前/之间正文」的情况 "
+            f"(与「先全部图再一段去占位符」不一致)。条数: {deviants}"
+        )
+    else:
+        print(
+            "结论: 未发现上述情况（在扫描范围内，对齐分支下首条 human 均为「仅占位符开头、"
+            "占位符之间无正文」）。"
+        )
     print(f"no_placeholders_in_first_human: {no_ph}")
-    print(f"aligned_placeholder_count==decoded_image_count (>0): {aligned}")
-    print(f"placeholder_vs_image_mismatch (either>0, not aligned): {mismatch}")
-    print(
-        "deviates_from_legacy_all_images_first "
-        "(aligned AND text before/between tokens): "
-        f"{deviants}"
-    )
+    print(f"aligned (n_placeholder==n_decoded_image>0): {aligned}")
+    print(f"placeholder_vs_image_mismatch (not aligned, either>0): {mismatch}")
+
+    print()
+    print("--- 示例（扫描中遇到的**第一条** deviant；若无则跳过）---")
+    if first_example is None:
+        print("(无)")
+    else:
+        ex = first_example
+        print(f"  file:         {ex['parquet_file']}")
+        print(f"  scan_row:     {ex['scan_row']}")
+        print(f"  id:           {ex['id']!r}")
+        print(f"  data_source:  {ex['data_source']!r}")
+        print(f"  n_placeholder / n_image_decoded: {ex['n_placeholder']} / {ex['n_image_decoded']}")
+        print(f"  flags:        {', '.join(ex['flags'])}")
+        print("  first_human_text_preview:")
+        for line in str(ex["first_human_text_preview"]).split("\n"):
+            print(f"    {line}")
 
 
 if __name__ == "__main__":
