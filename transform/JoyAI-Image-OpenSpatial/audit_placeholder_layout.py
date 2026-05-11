@@ -83,6 +83,13 @@ def text_layout_deviant(text: str) -> Tuple[bool, int, bool, bool]:
     )
 
 
+def _maybe_truncate(text: str, max_len: int) -> str:
+    """max_len <= 0 means no truncation."""
+    if max_len <= 0 or len(text) <= max_len:
+        return text
+    return text[:max_len] + "…"
+
+
 def _row_from_batch(names: List[str], cols: List[Any], row_idx: int) -> Dict[str, Any]:
     row: Dict[str, Any] = {}
     for name, col in zip(names, cols):
@@ -115,9 +122,10 @@ def _scan_row_group_task(
             if bad:
                 sid = str(normalize_scalar(row.get("id") or ""))
                 ds = str(normalize_scalar(row.get("data_source") or ""))
-                snip = text.replace("\r\n", "\n").replace("\r", "\n")
-                if len(snip) > snippet_max:
-                    snip = snip[:snippet_max] + "…"
+                snip = _maybe_truncate(
+                    text.replace("\r\n", "\n").replace("\r", "\n"),
+                    snippet_max,
+                )
                 flags: List[str] = []
                 if hl:
                     flags.append("leading_text")
@@ -131,7 +139,7 @@ def _scan_row_group_task(
                     "data_source": ds,
                     "n_placeholder": n_ph,
                     "flags": flags,
-                    "first_human_text_preview": snip,
+                    "first_human_text": snip,
                 }
             local_i += 1
     return None
@@ -255,9 +263,10 @@ def _run_full_scan(
                     if first_example is None:
                         sid = str(normalize_scalar(row.get("id") or ""))
                         ds = str(normalize_scalar(row.get("data_source") or ""))
-                        snip = text.replace("\r\n", "\n").replace("\r", "\n")
-                        if len(snip) > snippet_max:
-                            snip = snip[:snippet_max] + "…"
+                        snip = _maybe_truncate(
+                            text.replace("\r\n", "\n").replace("\r", "\n"),
+                            snippet_max,
+                        )
                         flags: List[str] = []
                         if hl:
                             flags.append("leading_text")
@@ -270,7 +279,7 @@ def _run_full_scan(
                             "data_source": ds,
                             "n_placeholder": n_ph,
                             "flags": flags,
-                            "first_human_text_preview": snip,
+                            "first_human_text": snip,
                         }
                 file_row += 1
                 pbar.update(1)
@@ -288,8 +297,8 @@ def _print_example(ex: Dict[str, Any]) -> None:
     print(f"  data_source:  {ex['data_source']!r}")
     print(f"  n_placeholder: {ex['n_placeholder']}")
     print(f"  flags:        {', '.join(ex['flags'])}")
-    print("  first_human_text_preview:")
-    for line in str(ex["first_human_text_preview"]).split("\n"):
+    print("  first_human_text:")
+    for line in str(ex["first_human_text"]).split("\n"):
         print(f"    {line}")
 
 
@@ -310,7 +319,12 @@ def main() -> None:
     )
     ap.add_argument("--max-rows", type=int, default=None, help="Only for --full-scan: cap rows scanned")
     ap.add_argument("--no-progress", action="store_true", help="Disable tqdm")
-    ap.add_argument("--snippet-len", type=int, default=400, help="Example text preview length")
+    ap.add_argument(
+        "--snippet-len",
+        type=int,
+        default=0,
+        help="Optional max chars when printing the example (0 = print full text, default)",
+    )
     args = ap.parse_args()
 
     d = args.parquet_dir
@@ -320,7 +334,7 @@ def main() -> None:
     if not files:
         raise SystemExit(f"No *.parquet under {d}")
 
-    snippet_max = max(80, args.snippet_len)
+    snippet_max = args.snippet_len
 
     if not args.full_scan:
         hit = _run_parallel_first_hit(
