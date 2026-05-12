@@ -188,7 +188,10 @@ def render_metadata_distribution_section(meta: Optional[Dict[str, Any]], *, pie_
         st.warning("需要 **altair** 与 **pandas**（通常随 streamlit 已安装）。可执行：`pip install altair pandas`")
         return
 
+    # Bar chart height; pies need extra vertical space so titles are not clipped
+    # (especially in two-column layout + use_container_width).
     CHART_H = 260
+    PIE_CHART_H = 340
     # Altair 6.1: encoding `radius` with selection (alt.condition / alt.when) serializes
     # to RadiusValue + condition, which the schema rejects. Use fixed outerRadius on mark.
     PIE_OUTER = 112
@@ -232,9 +235,11 @@ def render_metadata_distribution_section(meta: Optional[Dict[str, Any]], *, pie_
                     alt.Tooltip("percent:Q", title="占比", format=".2%"),
                 ],
             )
-            .properties(height=CHART_H, title=title)
+            .properties(height=PIE_CHART_H, title=alt.TitleParams(text=title, anchor="start"))
             .add_params(hover)
             .configure_view(strokeWidth=0)
+            .configure_title(fontSize=15, offset=10)
+            .configure(padding={"top": 16, "bottom": 8, "left": 4, "right": 4})
         )
 
     def _bar_images_altair(items: List[Tuple[str, int]]) -> Any:
