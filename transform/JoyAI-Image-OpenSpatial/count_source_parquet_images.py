@@ -12,7 +12,8 @@ Interprets the ``images`` column with fallbacks (in order):
 Rows that are ``None``, unsupported types, or empty string count toward
 ``rows_images_unsupported_or_empty`` with ``images_shape=unsupported``.
 
-Optional Pillow decode (``verify`` + ``load``) per slot: ``--validate-image-bytes``.
+By default, each image slot is decoded and checked with Pillow (``verify`` + ``load``).
+Pass ``--skip-validate`` to disable that (faster; no ``image_bytes_validation`` block).
 
 Parallelism: one thread per parquet file (default ``--workers 16``). Large row
 dicts and Arrow batches are released as soon as each batch is finished
@@ -139,7 +140,8 @@ def pil_can_open_and_load(payload: bytes) -> bool:
         from PIL import Image  # pyright: ignore[reportMissingImports]
     except ImportError:
         raise SystemExit(
-            "--validate-image-bytes requires Pillow. Install with: pip install Pillow"
+            "Image validation requires Pillow (default is on). "
+            "Install with: pip install Pillow, or pass --skip-validate."
         ) from None
     if not payload:
         return False
@@ -292,11 +294,10 @@ def parse_args() -> argparse.Namespace:
         help="Disable tqdm progress bars.",
     )
     p.add_argument(
-        "--validate-image-bytes",
+        "--skip-validate",
         action="store_true",
         help=(
-            "After resolving each slot to raw bytes, require Pillow verify+load. "
-            "Counts decode_fail (no bytes) and pil_invalid (bytes present but not an image)."
+            "Do not decode image bytes or run Pillow checks (default is to validate every slot)."
         ),
     )
     return p.parse_args()
@@ -343,7 +344,7 @@ def main() -> None:
     slot_pil_invalid = 0
     slot_pil_ok = 0
 
-    validate = bool(args.validate_image_bytes)
+    validate = not args.skip_validate
 
     if workers_eff == 1:
         remaining_cap = args.max_rows
@@ -428,7 +429,7 @@ def main() -> None:
         "image_slots_by_images_shape": dict(shape_slots.most_common()),
     }
 
-    if args.validate_image_bytes:
+    if not args.skip_validate:
         summary["image_bytes_validation"] = {
             "slots_pil_ok": slot_pil_ok,
             "slots_decode_failed": slot_decode_failed,

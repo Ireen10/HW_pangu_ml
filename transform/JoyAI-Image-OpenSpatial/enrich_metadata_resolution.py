@@ -6,12 +6,13 @@ Use when data was converted before resolution_stats existed, or to refresh after
 
   python enrich_metadata_resolution.py --dataset-root /path/to/output_root
 
-Optional: verify that each referenced tar member exists and decodes as an image (Pillow):
+By default, each jsonl-referenced tar member is read and verified with Pillow. Pass
+``--skip-validate`` to skip tar reads / PIL checks (faster; no ``image_read_validation`` block).
 
-  python enrich_metadata_resolution.py --dataset-root /path/to/output_root --validate-images
+  python enrich_metadata_resolution.py --dataset-root /path/to/output_root --skip-validate
 
 Parallelism: ``--workers`` (default 16) threads over ``jsonl/data_*.jsonl`` shards; tar-member
-indexing uses the same pool when ``--validate-images`` is set. Each worker keeps its own
+indexing uses the same pool when validation is enabled. Each worker keeps its own
 tar read cache (no shared TarFile handles). Large image blobs are released after each check
 (``del`` + optional ``gc.collect`` per shard).
 
@@ -73,24 +74,23 @@ def parse_args() -> argparse.Namespace:
         help="Optional cap for debugging (per jsonl file, not global)",
     )
     p.add_argument(
-        "--validate-images",
+        "--skip-validate",
         action="store_true",
         help=(
-            "Open each jsonl-referenced tar member and verify Pillow can decode it. "
-            "Slower; writes image_read_validation into metadata.json."
+            "Skip opening tar members and Pillow checks (default is to validate every referenced image)."
         ),
     )
     p.add_argument(
         "--tar-cache-size",
         type=int,
         default=32,
-        help="Max open data_*.tar readers per worker when --validate-images (default: 32).",
+        help="Max open data_*.tar readers per worker when validation is enabled (default: 32).",
     )
     p.add_argument(
         "--workers",
         type=int,
         default=16,
-        help="Thread pool size for jsonl shards (and tar index when validating). Default: 16.",
+        help="Thread pool size for jsonl shards (and tar index when validation is on). Default: 16.",
     )
     p.add_argument(
         "--no-progress",
@@ -215,7 +215,8 @@ def pil_image_bytes_readable(payload: bytes) -> bool:
         from PIL import Image  # pyright: ignore[reportMissingImports]
     except ImportError:
         raise SystemExit(
-            "Pillow is required for --validate-images. Install with: pip install Pillow"
+            "Image validation requires Pillow (default is on). "
+            "Install with: pip install Pillow, or pass --skip-validate."
         ) from None
 
     if not payload:
@@ -315,11 +316,14 @@ def main() -> None:
 
     workers_eff = max(1, args.workers)
     use_pbar = tqdm is not None and not args.no_progress
+    do_validate = not args.skip_validate
 
     tar_index: Optional[Dict[str, Path]] = None
-    if args.validate_images:
+    if do_validate:
         if not images_dir.is_dir():
-            raise SystemExit(f"--validate-images requires directory: {images_dir}")
+            raise SystemExit(
+                f"Image validation requires directory {images_dir} (or use --skip-validate)."
+            )
         tar_index = build_member_to_tar_path_index(
             images_dir,
             use_progress=use_pbar,
@@ -342,7 +346,7 @@ def main() -> None:
             part = _scan_one_jsonl_shard(
                 str(jpath),
                 args.max_lines,
-                bool(args.validate_images),
+                do_validate,
                 tar_index,
                 args.tar_cache_size,
             )
@@ -362,7 +366,7 @@ def main() -> None:
                     _scan_one_jsonl_shard,
                     str(jpath),
                     args.max_lines,
-                    bool(args.validate_images),
+                    do_validate,
                     tar_index,
                     args.tar_cache_size,
                 ): jpath
@@ -393,7 +397,7 @@ def main() -> None:
         except Exception:
             meta = {}
     meta["resolution_stats"] = block
-    if args.validate_images:
+    if do_validate:
         abnormal = v_missing + v_empty + v_pil_fail
         meta["image_read_validation"] = {
             "images_checked": v_checked,
@@ -408,7 +412,7 @@ def main() -> None:
 
     meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"Wrote resolution_stats for {block['total_images']} images → {meta_path}")
-    if args.validate_images:
+    if do_validate:
         iv = meta["image_read_validation"]
         print(
             f"image_read_validation: checked={iv['images_checked']} "
