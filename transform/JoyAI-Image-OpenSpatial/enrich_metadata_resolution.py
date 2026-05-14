@@ -10,18 +10,25 @@ Optional: verify that each referenced tar member exists and decodes as an image 
 
   python enrich_metadata_resolution.py --dataset-root /path/to/output_root --validate-images
 
+Parallelism: ``--workers`` (default 16) threads over ``jsonl/data_*.jsonl`` shards; tar-member
+indexing uses the same pool when ``--validate-images`` is set. Each worker keeps its own
+tar read cache (no shared TarFile handles). Large image blobs are released after each check
+(``del`` + optional ``gc.collect`` per shard).
+
 Progress bars use tqdm when installed (``pip install tqdm``); disable with ``--no-progress``.
 """
 from __future__ import annotations
 
 import argparse
+import gc
 import io
 import json
 import sys
 import tarfile
 from collections import OrderedDict
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 try:
     from tqdm import tqdm
@@ -36,6 +43,7 @@ if str(_SCRIPT_DIR) not in sys.path:
 from resolution_stats import (  # noqa: E402
     accumulate_from_pangu_sample,
     empty_resolution_accumulator,
+    merge_resolution_accumulators,
     resolution_accumulator_to_metadata,
 )
 
@@ -76,12 +84,18 @@ def parse_args() -> argparse.Namespace:
         "--tar-cache-size",
         type=int,
         default=32,
-        help="Max open data_*.tar readers when --validate-images is set (default: 32).",
+        help="Max open data_*.tar readers per worker when --validate-images (default: 32).",
+    )
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=16,
+        help="Thread pool size for jsonl shards (and tar index when validating). Default: 16.",
     )
     p.add_argument(
         "--no-progress",
         action="store_true",
-        help="Disable tqdm progress (tar index + per-jsonl line streams).",
+        help="Disable tqdm progress (tar index + jsonl).",
     )
     return p.parse_args()
 
@@ -106,27 +120,64 @@ def iter_first_user_image_relative_paths(sample: dict) -> List[str]:
     return out
 
 
+def _index_one_tar_shard(tar_path_str: str) -> List[str]:
+    """Return file member names for one data_*.tar (paths come from zip order)."""
+    tar_path = Path(tar_path_str)
+    out: List[str] = []
+    with tarfile.open(tar_path, "r:*") as tf:
+        for m in tf.getmembers():
+            if m.isfile():
+                out.append(m.name)
+    return out
+
+
 def build_member_to_tar_path_index(
     images_dir: Path,
     *,
     use_progress: bool,
+    workers: int,
 ) -> Dict[str, Path]:
     """Map tar member name -> path of the data_*.tar that contains it."""
-    index: Dict[str, Path] = {}
     tar_paths = sorted(images_dir.glob("data_*.tar"))
-    tar_iter = tar_paths
-    if use_progress and tqdm is not None:
-        tar_iter = tqdm(tar_paths, desc="Indexing tar shards", unit="tar")
-    for tar_path in tar_iter:
-        with tarfile.open(tar_path, "r:*") as tf:
-            for m in tf.getmembers():
-                if m.isfile():
-                    index[m.name] = tar_path
+    if not tar_paths:
+        return {}
+
+    workers_eff = max(1, min(workers, len(tar_paths)))
+    if workers_eff == 1:
+        index: Dict[str, Path] = {}
+        tar_iter: Any = tar_paths
+        if use_progress and tqdm is not None:
+            tar_iter = tqdm(tar_paths, desc="Indexing tar shards", unit="tar")
+        for tar_path in tar_iter:
+            with tarfile.open(tar_path, "r:*") as tf:
+                for m in tf.getmembers():
+                    if m.isfile():
+                        index[m.name] = tar_path
+        return index
+
+    index = {}
+    max_w = workers_eff
+    with ThreadPoolExecutor(max_workers=max_w) as ex:
+        futs = [ex.submit(_index_one_tar_shard, str(p)) for p in tar_paths]
+        pbar = None
+        if use_progress and tqdm is not None:
+            pbar = tqdm(total=len(futs), desc="Indexing tar shards", unit="tar")
+        part_list: List[List[str]] = []
+        for fut in futs:
+            part_list.append(fut.result())
+            if pbar is not None:
+                pbar.update(1)
+        if pbar is not None:
+            pbar.close()
+    for tar_path, names in zip(tar_paths, part_list):
+        for name in names:
+            index[name] = tar_path
+    del part_list
     return index
 
 
 class _TarReaderCache:
-    """Small LRU of open TarFile handles to avoid reopening the same shard repeatedly."""
+    """Small LRU of open TarFile handles (one cache per worker thread)."""
 
     def __init__(self, max_open: int) -> None:
         self._max_open = max(1, max_open)
@@ -141,7 +192,7 @@ class _TarReaderCache:
             self._open.move_to_end(tar_path)
 
         while len(self._open) > self._max_open:
-            old_path, old_tf = self._open.popitem(last=False)
+            _old_path, old_tf = self._open.popitem(last=False)
             old_tf.close()
 
         reader = tf.extractfile(member_name)
@@ -151,6 +202,11 @@ class _TarReaderCache:
             return reader.read()
         finally:
             reader.close()
+
+    def close_all(self) -> None:
+        while self._open:
+            _p, tf = self._open.popitem(last=False)
+            tf.close()
 
 
 def pil_image_bytes_readable(payload: bytes) -> bool:
@@ -174,6 +230,77 @@ def pil_image_bytes_readable(payload: bytes) -> bool:
         return False
 
 
+def _scan_one_jsonl_shard(
+    jpath_str: str,
+    max_lines: Optional[int],
+    validate: bool,
+    tar_index: Optional[Dict[str, Path]],
+    tar_cache_size: int,
+) -> Dict[str, Any]:
+    """
+    Process one jsonl shard: resolution stats + optional tar/PIL validation.
+    Each thread uses its own _TarReaderCache (TarFile is not shared across threads).
+    """
+    acc = empty_resolution_accumulator()
+    v_missing = v_empty = v_pil_fail = 0
+    v_checked = 0
+    lines_read = 0
+
+    tar_cache = _TarReaderCache(tar_cache_size) if validate and tar_index else None
+
+    jpath = Path(jpath_str)
+    with jpath.open("r", encoding="utf-8") as f:
+        for li, line in enumerate(f):
+            lines_read += 1
+            if max_lines is not None and li >= max_lines:
+                break
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+
+            accumulate_from_pangu_sample(
+                acc, obj, normalize_data_source_fn=normalize_data_source
+            )
+
+            if validate and tar_index is not None and tar_cache is not None:
+                for rel in iter_first_user_image_relative_paths(obj):
+                    v_checked += 1
+                    tp = tar_index.get(rel)
+                    if tp is None:
+                        v_missing += 1
+                        continue
+                    blob = tar_cache.extract_bytes(tp, rel)
+                    if not blob:
+                        v_empty += 1
+                        continue
+                    if not pil_image_bytes_readable(blob):
+                        v_pil_fail += 1
+                    del blob
+
+            del obj
+
+    if tar_cache is not None:
+        tar_cache.close_all()
+
+    gc.collect()
+
+    return {
+        "path": jpath_str,
+        "lines_read": lines_read,
+        "resolution_partial": acc,
+        "v_missing": v_missing,
+        "v_empty": v_empty,
+        "v_pil_fail": v_pil_fail,
+        "v_checked": v_checked,
+    }
+
+
 def main() -> None:
     args = parse_args()
     root: Path = args.dataset_root
@@ -182,61 +309,81 @@ def main() -> None:
     meta_path = root / "metadata.json"
     if not jsonl_dir.is_dir():
         raise SystemExit(f"Not a directory: {jsonl_dir}")
-    acc = empty_resolution_accumulator()
     jsonl_files = sorted(jsonl_dir.glob("data_*.jsonl"))
     if not jsonl_files:
         raise SystemExit(f"No jsonl shards under {jsonl_dir}")
 
-    tar_index: Optional[Dict[str, Path]] = None
-    tar_cache: Optional[_TarReaderCache] = None
-    v_missing = v_empty = v_pil_fail = 0
-    v_checked = 0
-
+    workers_eff = max(1, args.workers)
     use_pbar = tqdm is not None and not args.no_progress
 
+    tar_index: Optional[Dict[str, Path]] = None
     if args.validate_images:
         if not images_dir.is_dir():
             raise SystemExit(f"--validate-images requires directory: {images_dir}")
-        tar_index = build_member_to_tar_path_index(images_dir, use_progress=use_pbar)
-        tar_cache = _TarReaderCache(args.tar_cache_size)
+        tar_index = build_member_to_tar_path_index(
+            images_dir,
+            use_progress=use_pbar,
+            workers=workers_eff,
+        )
 
-    for jpath in jsonl_files:
-        with jpath.open("r", encoding="utf-8") as f:
-            line_iter = enumerate(f)
-            if use_pbar:
-                line_iter = tqdm(
-                    line_iter,
-                    desc=f"jsonl {jpath.name}",
-                    unit="line",
-                    leave=False,
-                )
-            for li, line in line_iter:
-                if args.max_lines is not None and li >= args.max_lines:
-                    break
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(obj, dict):
-                    accumulate_from_pangu_sample(
-                        acc, obj, normalize_data_source_fn=normalize_data_source
-                    )
-                    if args.validate_images and tar_index is not None and tar_cache is not None:
-                        for rel in iter_first_user_image_relative_paths(obj):
-                            v_checked += 1
-                            tp = tar_index.get(rel)
-                            if tp is None:
-                                v_missing += 1
-                                continue
-                            blob = tar_cache.extract_bytes(tp, rel)
-                            if not blob:
-                                v_empty += 1
-                                continue
-                            if not pil_image_bytes_readable(blob):
-                                v_pil_fail += 1
+    acc = empty_resolution_accumulator()
+    v_missing = v_empty = v_pil_fail = 0
+    v_checked = 0
+
+    jsonl_workers = min(workers_eff, len(jsonl_files))
+    pbar_lines = (
+        tqdm(total=None, desc="jsonl lines", unit="line", smoothing=0.05)
+        if use_pbar
+        else None
+    )
+
+    if jsonl_workers == 1:
+        for jpath in jsonl_files:
+            part = _scan_one_jsonl_shard(
+                str(jpath),
+                args.max_lines,
+                bool(args.validate_images),
+                tar_index,
+                args.tar_cache_size,
+            )
+            merge_resolution_accumulators(acc, part["resolution_partial"])
+            v_missing += int(part["v_missing"])
+            v_empty += int(part["v_empty"])
+            v_pil_fail += int(part["v_pil_fail"])
+            v_checked += int(part["v_checked"])
+            if pbar_lines is not None:
+                pbar_lines.update(int(part["lines_read"]))
+            del part
+    else:
+        max_w = jsonl_workers
+        with ThreadPoolExecutor(max_workers=max_w) as ex:
+            pending = {
+                ex.submit(
+                    _scan_one_jsonl_shard,
+                    str(jpath),
+                    args.max_lines,
+                    bool(args.validate_images),
+                    tar_index,
+                    args.tar_cache_size,
+                ): jpath
+                for jpath in jsonl_files
+            }
+            while pending:
+                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for fut in done:
+                    pending.pop(fut)
+                    part = fut.result()
+                    merge_resolution_accumulators(acc, part["resolution_partial"])
+                    v_missing += int(part["v_missing"])
+                    v_empty += int(part["v_empty"])
+                    v_pil_fail += int(part["v_pil_fail"])
+                    v_checked += int(part["v_checked"])
+                    if pbar_lines is not None:
+                        pbar_lines.update(int(part["lines_read"]))
+                    del part
+
+    if pbar_lines is not None:
+        pbar_lines.close()
 
     block = resolution_accumulator_to_metadata(acc)
     meta: dict = {}
@@ -256,7 +403,9 @@ def main() -> None:
             "pil_decode_failed": v_pil_fail,
             "tar_members_indexed": len(tar_index or {}),
             "tar_cache_size": args.tar_cache_size,
+            "workers_effective": workers_eff,
         }
+
     meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"Wrote resolution_stats for {block['total_images']} images → {meta_path}")
     if args.validate_images:
