@@ -2,24 +2,35 @@
 """
 Aggregate image counts from source JoyAI-Image-OpenSpatial parquet shards.
 
-Counts each row's ``images`` field when it is a list (length = number of image slots).
-Rows where ``images`` is missing or not a list are tallied separately.
+Interprets the ``images`` column with fallbacks (in order):
+
+1. ``list`` of dicts (HF style: ``{"bytes": ...}``) — one slot per element.
+2. ``list`` of strings — treated as **one base64 payload per element** (pure base64 list).
+3. ``list`` of ``bytes`` / ``bytearray`` — one slot per element.
+4. A single non-empty ``str`` — treated as **one** base64 payload (whole column is one image).
+
+Rows that are ``None``, unsupported types, or empty string count toward
+``rows_images_unsupported_or_empty`` with ``images_shape=unsupported``.
+
+Optional Pillow decode (``verify`` + ``load``) per slot: ``--validate-image-bytes``.
 
   python transform/JoyAI-Image-OpenSpatial/count_source_parquet_images.py \\
     --parquet-dir /path/to/parquet_dir
 
-Optional JSON summary:
-
-  python .../count_source_parquet_images.py --parquet-dir /path --output-json stats.json
+  python .../count_source_parquet_images.py --parquet-dir /path --validate-image-bytes
 """
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
+import io
 import json
+import re
 import sys
 from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pyarrow.parquet as pq
 
@@ -29,10 +40,111 @@ except ImportError:  # pragma: no cover
     tqdm = None  # type: ignore[misc, assignment]
 
 
+_DATA_URL_PREFIX_RE = re.compile(
+    r"^data:image/[^;]+;base64,",
+    flags=re.IGNORECASE,
+)
+
+
 def normalize_scalar(value: Any) -> Any:
     if hasattr(value, "as_py"):
         return value.as_py()
     return value
+
+
+def _strip_data_url_base64_prefix(s: str) -> str:
+    s = s.strip()
+    return _DATA_URL_PREFIX_RE.sub("", s, count=1)
+
+
+def _b64decode_maybe(s: str) -> Optional[bytes]:
+    raw = _strip_data_url_base64_prefix(s)
+    if not raw:
+        return None
+    try:
+        return base64.b64decode(raw, validate=False)
+    except (binascii.Error, ValueError):
+        return None
+
+
+def _bytes_from_dict_slot(obj: Dict[str, Any]) -> Optional[bytes]:
+    """Match convert_to_pangu_ml.load_image_bytes semantics for dict slots."""
+    bv = obj.get("bytes")
+    bv = normalize_scalar(bv)
+    if bv in (None, "", b""):
+        return None
+    if isinstance(bv, (bytes, bytearray)):
+        return bytes(bv)
+    if isinstance(bv, memoryview):
+        return bv.tobytes()
+    if isinstance(bv, str):
+        return _b64decode_maybe(bv)
+    return None
+
+
+def decode_slot_to_raw_bytes(item: Any) -> Optional[bytes]:
+    """Best-effort raw payload for one image slot (any supported shape)."""
+    item = normalize_scalar(item)
+    if isinstance(item, dict):
+        return _bytes_from_dict_slot(item)
+    if isinstance(item, str):
+        return _b64decode_maybe(item)
+    if isinstance(item, (bytes, bytearray)):
+        return bytes(item)
+    if isinstance(item, memoryview):
+        return item.tobytes()
+    return None
+
+
+def classify_and_count_image_slots(images_raw: Any) -> Tuple[int, str]:
+    """
+    Return (slot_count, shape_label).
+
+    shape_label is one of:
+      list_of_dict, list_of_base64_strings, list_of_bytes, empty_list,
+      single_base64_string, unsupported
+    """
+    images_raw = normalize_scalar(images_raw)
+    if images_raw is None:
+        return 0, "unsupported"
+    if isinstance(images_raw, str):
+        stripped = images_raw.strip()
+        if not stripped:
+            return 0, "unsupported"
+        return 1, "single_base64_string"
+    if not isinstance(images_raw, list):
+        return 0, "unsupported"
+    n = len(images_raw)
+    if n == 0:
+        return 0, "empty_list"
+    first = normalize_scalar(images_raw[0])
+    if isinstance(first, dict):
+        return n, "list_of_dict"
+    if isinstance(first, str):
+        return n, "list_of_base64_strings"
+    if isinstance(first, (bytes, bytearray, memoryview)):
+        return n, "list_of_bytes"
+    # Rare: list/tuple of non-uniform types — still count elements as slots.
+    return n, "list_mixed_or_unknown"
+
+
+def pil_can_open_and_load(payload: bytes) -> bool:
+    try:
+        from PIL import Image  # pyright: ignore[reportMissingImports]
+    except ImportError:
+        raise SystemExit(
+            "--validate-image-bytes requires Pillow. Install with: pip install Pillow"
+        ) from None
+    if not payload:
+        return False
+    try:
+        with Image.open(io.BytesIO(payload)) as im:
+            im.verify()
+        with Image.open(io.BytesIO(payload)) as im:
+            im.load()
+        return True
+    except Exception:
+        return False
 
 
 def iter_parquet_rows_single_file(
@@ -54,6 +166,10 @@ def iter_parquet_rows_single_file(
                 row[name] = value.as_py() if hasattr(value, "as_py") else value
             yield row
             yielded += 1
+
+
+def _total_rows_in_dir(parquet_files: List[Path]) -> int:
+    return sum(pq.ParquetFile(p).metadata.num_rows for p in parquet_files)
 
 
 def parse_args() -> argparse.Namespace:
@@ -85,7 +201,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--no-progress",
         action="store_true",
-        help="Disable tqdm row progress.",
+        help="Disable tqdm progress bars.",
+    )
+    p.add_argument(
+        "--validate-image-bytes",
+        action="store_true",
+        help=(
+            "After resolving each slot to raw bytes, require Pillow verify+load. "
+            "Counts decode_fail (no bytes) and pil_invalid (bytes present but not an image)."
+        ),
     )
     return p.parse_args()
 
@@ -100,14 +224,34 @@ def main() -> None:
     if not parquet_files:
         raise SystemExit(f"No *.parquet under {parquet_dir}")
 
+    total_rows_dataset = _total_rows_in_dir(parquet_files)
+    pbar_total: Optional[int] = total_rows_dataset
+    if args.max_rows is not None:
+        pbar_total = min(args.max_rows, total_rows_dataset)
+
     total_rows = 0
     total_source_images = 0
-    rows_images_not_a_list = 0
+    rows_images_unsupported_or_empty = 0
     per_row_image_count = Counter()
+    shape_rows = Counter()
+    shape_slots = Counter()
     remaining_cap = args.max_rows
 
+    slot_decode_failed = 0
+    slot_pil_invalid = 0
+    slot_pil_ok = 0
+
     use_pbar = tqdm is not None and not args.no_progress
-    pbar = tqdm(desc="Rows", unit="row") if use_pbar else None
+    pbar = (
+        tqdm(
+            total=pbar_total,
+            desc="Rows",
+            unit="row",
+            smoothing=0.05,
+        )
+        if use_pbar
+        else None
+    )
 
     for ppath in parquet_files:
         max_for_file: Optional[int] = None
@@ -121,13 +265,34 @@ def main() -> None:
             if remaining_cap is not None:
                 remaining_cap -= 1
 
-            images_raw = normalize_scalar(row.get("images"))
-            if isinstance(images_raw, list):
-                n = len(images_raw)
-                total_source_images += n
-                per_row_image_count[n] += 1
-            else:
-                rows_images_not_a_list += 1
+            images_raw = row.get("images")
+            n, shape = classify_and_count_image_slots(images_raw)
+            shape_rows[shape] += 1
+            if n == 0 and shape in ("unsupported", "empty_list"):
+                rows_images_unsupported_or_empty += 1
+            shape_slots[shape] += n
+            total_source_images += n
+
+            per_row_image_count[n] += 1
+
+            if args.validate_image_bytes and n > 0:
+                images_norm = normalize_scalar(images_raw)
+                if isinstance(images_norm, str):
+                    items: List[Any] = [images_norm]
+                elif isinstance(images_norm, list):
+                    items = list(images_norm)
+                else:
+                    items = []
+
+                for it in items:
+                    raw = decode_slot_to_raw_bytes(it)
+                    if raw is None:
+                        slot_decode_failed += 1
+                        continue
+                    if pil_can_open_and_load(raw):
+                        slot_pil_ok += 1
+                    else:
+                        slot_pil_invalid += 1
 
             if pbar is not None:
                 pbar.update(1)
@@ -138,16 +303,27 @@ def main() -> None:
     summary: Dict[str, Any] = {
         "parquet_dir": str(parquet_dir.resolve()),
         "parquet_file_count": len(parquet_files),
-        "total_rows": total_rows,
+        "parquet_total_rows_metadata": total_rows_dataset,
+        "total_rows_scanned": total_rows,
         "total_source_images": total_source_images,
-        "rows_where_images_not_a_list": rows_images_not_a_list,
+        "rows_images_unsupported_or_empty": rows_images_unsupported_or_empty,
         "avg_images_per_row": (
             round(total_source_images / total_rows, 6) if total_rows else 0.0
         ),
         "images_per_row_histogram": {
             str(k): int(v) for k, v in sorted(per_row_image_count.items())
         },
+        "rows_by_images_shape": dict(shape_rows.most_common()),
+        "image_slots_by_images_shape": dict(shape_slots.most_common()),
     }
+
+    if args.validate_image_bytes:
+        summary["image_bytes_validation"] = {
+            "slots_pil_ok": slot_pil_ok,
+            "slots_decode_failed": slot_decode_failed,
+            "slots_pil_invalid": slot_pil_invalid,
+            "slots_checked": slot_pil_ok + slot_decode_failed + slot_pil_invalid,
+        }
 
     if args.output_json is not None:
         args.output_json.parent.mkdir(parents=True, exist_ok=True)

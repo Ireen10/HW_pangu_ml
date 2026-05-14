@@ -9,6 +9,8 @@ Use when data was converted before resolution_stats existed, or to refresh after
 Optional: verify that each referenced tar member exists and decodes as an image (Pillow):
 
   python enrich_metadata_resolution.py --dataset-root /path/to/output_root --validate-images
+
+Progress bars use tqdm when installed (``pip install tqdm``); disable with ``--no-progress``.
 """
 from __future__ import annotations
 
@@ -20,6 +22,11 @@ import tarfile
 from collections import OrderedDict
 from pathlib import Path
 from typing import Dict, List, Optional
+
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover
+    tqdm = None  # type: ignore[misc, assignment]
 
 # Same directory as this script (works when run from repo or from this folder)
 _SCRIPT_DIR = Path(__file__).resolve().parent
@@ -71,6 +78,11 @@ def parse_args() -> argparse.Namespace:
         default=32,
         help="Max open data_*.tar readers when --validate-images is set (default: 32).",
     )
+    p.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable tqdm progress (tar index + per-jsonl line streams).",
+    )
     return p.parse_args()
 
 
@@ -94,10 +106,18 @@ def iter_first_user_image_relative_paths(sample: dict) -> List[str]:
     return out
 
 
-def build_member_to_tar_path_index(images_dir: Path) -> Dict[str, Path]:
+def build_member_to_tar_path_index(
+    images_dir: Path,
+    *,
+    use_progress: bool,
+) -> Dict[str, Path]:
     """Map tar member name -> path of the data_*.tar that contains it."""
     index: Dict[str, Path] = {}
-    for tar_path in sorted(images_dir.glob("data_*.tar")):
+    tar_paths = sorted(images_dir.glob("data_*.tar"))
+    tar_iter = tar_paths
+    if use_progress and tqdm is not None:
+        tar_iter = tqdm(tar_paths, desc="Indexing tar shards", unit="tar")
+    for tar_path in tar_iter:
         with tarfile.open(tar_path, "r:*") as tf:
             for m in tf.getmembers():
                 if m.isfile():
@@ -172,15 +192,25 @@ def main() -> None:
     v_missing = v_empty = v_pil_fail = 0
     v_checked = 0
 
+    use_pbar = tqdm is not None and not args.no_progress
+
     if args.validate_images:
         if not images_dir.is_dir():
             raise SystemExit(f"--validate-images requires directory: {images_dir}")
-        tar_index = build_member_to_tar_path_index(images_dir)
+        tar_index = build_member_to_tar_path_index(images_dir, use_progress=use_pbar)
         tar_cache = _TarReaderCache(args.tar_cache_size)
 
     for jpath in jsonl_files:
         with jpath.open("r", encoding="utf-8") as f:
-            for li, line in enumerate(f):
+            line_iter = enumerate(f)
+            if use_pbar:
+                line_iter = tqdm(
+                    line_iter,
+                    desc=f"jsonl {jpath.name}",
+                    unit="line",
+                    leave=False,
+                )
+            for li, line in line_iter:
                 if args.max_lines is not None and li >= args.max_lines:
                     break
                 line = line.strip()
