@@ -50,11 +50,12 @@
 
 ### D. 图像命名规则和 tar 内目录层级
 
-`{id}.jpg` 对多图不够，且可能冲突。脚本固定采用全局 flat 命名，并统一转成 JPEG：
+`{id}.jpg` 对多图不够，且可能冲突。脚本固定采用全局 flat 命名；**编码与扩展名**由 Pillow 识别的源格式决定：
 
-- `relative_path = {safe_sample_id}_{image_idx:02d}.jpg`
+- **Pillow 识别为 PNG**（`format == PNG`）：写入 **PNG**（`optimize=True`），`relative_path = …_{idx:02d}.png`，jsonl 中 `format` 为 `image/png`（尽量保留透明通道）。
+- **其它格式**（JPEG、WebP、GIF 等）：转为 **JPEG quality=95**，`relative_path = …_{idx:02d}.jpg`，`format` 为 `image/jpeg`。
 - 不按 sample 建子目录，避免 tar 内大量小目录。
-- `width/height` 固定从图像字节解析，不使用 `meta_info` 尺寸字段。
+- `width/height` 固定从解码后的图像解析，不使用 `meta_info` 尺寸字段。
 
 ### E. 会不会有“对话轮次不合法”的样本？
 
@@ -114,7 +115,7 @@
 
 ### 3.2 映射后的 Pangu 样本（手工展开示例）
 
-> 说明：图像路径采用固定 flat 规则：`{safe_sample_id}_{image_idx:02d}.jpg`，并统一 `format=image/jpeg`。
+> 说明：图像路径采用固定 flat 规则；下例源图为 PNG，故为 `…_00.png` 且 `format=image/png`（若为 JPEG 源则对应 `.jpg` / `image/jpeg`）。
 
 ```json
 {
@@ -129,8 +130,8 @@
           "type": "image",
           "image": {
             "type": "relative_path",
-            "format": "image/jpeg",
-            "relative_path": "arkitscenes__a1d03f7f-cabf-482e-8fd0-67f2dfd7464f_00.jpg",
+            "format": "image/png",
+            "relative_path": "arkitscenes__a1d03f7f-cabf-482e-8fd0-67f2dfd7464f_00.png",
             "width": 256,
             "height": 192
           }

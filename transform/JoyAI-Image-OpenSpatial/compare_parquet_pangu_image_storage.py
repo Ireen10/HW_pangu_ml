@@ -251,7 +251,16 @@ def main() -> None:
                 if i < len(p_paths):
                     image_id = p_paths[i]
                 else:
-                    image_id = conv.build_tar_relative_path(sample_id, i)
+                    image_id = None
+                    for mime in (conv.MIME_JPEG, conv.MIME_PNG):
+                        cand = conv.build_tar_relative_path(sample_id, i, mime)
+                        if cand in tar_sizes:
+                            image_id = cand
+                            break
+                    if image_id is None:
+                        image_id = conv.build_tar_relative_path(
+                            sample_id, i, conv.MIME_JPEG
+                        )
 
                 payload: Optional[bytes] = None
                 if isinstance(images_raw, list) and i < n_src:

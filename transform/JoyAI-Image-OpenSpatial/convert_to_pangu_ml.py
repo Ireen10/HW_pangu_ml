@@ -34,7 +34,9 @@ _INDEX_STRIDE = 1_000_000_000
 
 DATASET_NAME = "jdopensource/JoyAI-Image-OpenSpatial"
 ROLE_MAP = {"human": "user", "gpt": "assistant"}
-IMAGE_FORMAT = "image/jpeg"
+# Pangu image `format` + tar extension: PNG sources stay PNG; everything else -> JPEG.
+MIME_PNG = "image/png"
+MIME_JPEG = "image/jpeg"
 CATEGORY_KEYS = ("category", "sub_category", "subcategory", "ability", "task", "label")
 # Matches common image-placeholder tokens used by different VLMs:
 #   <image>           LLaVA / ShareGPT4V style
@@ -554,9 +556,10 @@ def make_sample_id(row: Dict[str, Any], row_index: int) -> str:
     return f"{data_source}__{raw_id}"
 
 
-def build_tar_relative_path(sample_id: str, img_idx: int) -> str:
+def build_tar_relative_path(sample_id: str, img_idx: int, image_format_mime: str) -> str:
     safe_id = sanitize_for_path(sample_id)
-    filename = f"{safe_id}_{img_idx:02d}.jpg"
+    ext = ".png" if image_format_mime == MIME_PNG else ".jpg"
+    filename = f"{safe_id}_{img_idx:02d}{ext}"
     return filename
 
 
@@ -610,10 +613,10 @@ def _count_image_slots(segments: List[Tuple[str, str]]) -> int:
 
 def build_first_user_multimodal_content(
     first_user_raw_text: str,
-    image_rows: List[Tuple[str, bytes, int, int]],
+    image_rows: List[Tuple[str, bytes, int, int, str]],
 ) -> List[Dict[str, Any]]:
     """
-    image_rows: (tar_relative_path, jpeg_bytes, width, height) per successfully decoded image.
+    image_rows: (tar_relative_path, encoded_bytes, width, height, format_mime) per image.
 
     If the text contains the same number of image placeholders as image_rows (>0),
     emit image/text parts in placeholder order. Otherwise fall back to: all images
@@ -624,12 +627,12 @@ def build_first_user_multimodal_content(
     n_slot = _count_image_slots(segments)
 
     def _image_part(idx: int) -> Dict[str, Any]:
-        rel, _b, w, h = image_rows[idx]
+        rel, _b, w, h, mime = image_rows[idx]
         return {
             "type": "image",
             "image": {
                 "type": "relative_path",
-                "format": IMAGE_FORMAT,
+                "format": mime,
                 "relative_path": rel,
                 "width": int(w),
                 "height": int(h),
@@ -658,21 +661,49 @@ def build_first_user_multimodal_content(
     return content
 
 
-def convert_to_jpeg_and_get_size(image_bytes: bytes) -> Tuple[bytes, int, int]:
+def _prepare_for_png_save(img: Any) -> Any:
+    """Return a Pillow image suitable for PNG serialization (preserve alpha when needed)."""
+    if img.mode == "P":
+        if "transparency" in img.info:
+            return img.convert("RGBA")
+        return img.convert("RGB")
+    if img.mode == "LA":
+        return img.convert("RGBA")
+    if img.mode in ("RGBA", "RGB", "L", "1"):
+        return img
+    return img.convert("RGB")
+
+
+def encode_image_for_pangu_tar(image_bytes: bytes) -> Tuple[bytes, int, int, str]:
+    """
+    Encode bytes for tar + jsonl: Pillow-detected PNG -> PNG (image/png); else -> JPEG q=95.
+
+    On failure, returns raw bytes with geometry -1 and a best-effort mime from magic bytes.
+    """
     try:
         from PIL import Image  # pyright: ignore[reportMissingImports]
 
         with Image.open(io.BytesIO(image_bytes)) as img:
             width, height = img.width, img.height
-            if img.mode in ("RGBA", "LA", "P"):
-                img = img.convert("RGB")
-            elif img.mode != "RGB":
-                img = img.convert("RGB")
+            fmt = (img.format or "").upper()
+
+            if fmt == "PNG":
+                im_out = _prepare_for_png_save(img)
+                buf = io.BytesIO()
+                im_out.save(buf, format="PNG", optimize=True)
+                return buf.getvalue(), width, height, MIME_PNG
+
+            im_j = img
+            if im_j.mode in ("RGBA", "LA", "P"):
+                im_j = im_j.convert("RGB")
+            elif im_j.mode != "RGB":
+                im_j = im_j.convert("RGB")
             buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=95)
-            return buf.getvalue(), width, height
+            im_j.save(buf, format="JPEG", quality=95)
+            return buf.getvalue(), width, height, MIME_JPEG
     except Exception:
-        return image_bytes, -1, -1
+        mime = MIME_PNG if image_bytes.startswith(b"\x89PNG\r\n\x1a\n") else MIME_JPEG
+        return image_bytes, -1, -1, mime
 
 
 def to_role(raw_role: Any) -> Optional[str]:
@@ -722,7 +753,7 @@ def build_pangu_sample_parts(
         text_value = "" if value is None else str(normalize_scalar(value))
         turns.append({"role": role, "text": text_value})
 
-    image_rows: List[Tuple[str, bytes, int, int]] = []
+    image_rows: List[Tuple[str, bytes, int, int, str]] = []
     tar_members: List[Tuple[str, bytes]] = []
     for img_idx, image_obj in enumerate(images):
         image_obj = normalize_scalar(image_obj)
@@ -731,10 +762,10 @@ def build_pangu_sample_parts(
         source_image_bytes = load_image_bytes(image_obj)
         if source_image_bytes is None:
             continue
-        image_bytes, width, height = convert_to_jpeg_and_get_size(source_image_bytes)
-        tar_relative_path = build_tar_relative_path(sample_id, img_idx)
+        image_bytes, width, height, mime = encode_image_for_pangu_tar(source_image_bytes)
+        tar_relative_path = build_tar_relative_path(sample_id, img_idx, mime)
         tar_members.append((tar_relative_path, image_bytes))
-        image_rows.append((tar_relative_path, image_bytes, int(width), int(height)))
+        image_rows.append((tar_relative_path, image_bytes, int(width), int(height), mime))
 
     first_user_content = build_first_user_multimodal_content(turns[0]["text"], image_rows)
 

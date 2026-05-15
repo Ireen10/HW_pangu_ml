@@ -40,11 +40,11 @@ def test_readme_example_roundtrip(monkeypatch) -> None:
     category = conv.infer_subtask_from_row(row)
     assert category == "grounding_3d.single_view"
 
-    # Avoid dependency on Pillow in test env: stub decoder.
-    def _stub_convert_to_jpeg_and_get_size(_b: bytes):
-        return b"jpeg-bytes", 256, 192
+    # Avoid dependency on Pillow in test env: stub encoder.
+    def _stub_encode_image_for_pangu_tar(_b: bytes):
+        return b"jpeg-bytes", 256, 192, "image/jpeg"
 
-    monkeypatch.setattr(conv, "convert_to_jpeg_and_get_size", _stub_convert_to_jpeg_and_get_size)
+    monkeypatch.setattr(conv, "encode_image_for_pangu_tar", _stub_encode_image_for_pangu_tar)
 
     tar_buf = io.BytesIO()
     with tarfile.open(fileobj=tar_buf, mode="w") as tf:
@@ -55,23 +55,25 @@ def test_readme_example_roundtrip(monkeypatch) -> None:
     assert sample["id"] == "arkitscenes__a1d03f7f-cabf-482e-8fd0-67f2dfd7464f"
     assert sample["category"] == "grounding_3d.single_view"
 
-    # First user turn: image first, then text with <image> stripped.
+    # User turn: image + text parts (order follows <image> placeholders in the prompt).
     data = sample["data"]
     assert data[0]["role"] == "user"
     assert data[1]["role"] == "assistant"
 
     user_content = data[0]["content"]
-    assert user_content[0]["type"] == "image"
-    assert user_content[1]["type"] == "text"
+    image_parts = [p for p in user_content if p["type"] == "image"]
+    text_parts = [p for p in user_content if p["type"] == "text"]
+    assert len(image_parts) == 1
+    assert len(text_parts) >= 1
 
-    img = user_content[0]["image"]
+    img = image_parts[0]["image"]
     assert img["format"] == "image/jpeg"
     assert img["relative_path"].endswith("_00.jpg")
     assert img["width"] == 256
     assert img["height"] == 192
 
-    user_text = user_content[1]["text"]["string"]
-    assert "<image>" not in user_text.lower()
+    combined_user_text = "\n".join(p["text"]["string"] for p in text_parts)
+    assert "<image>" not in combined_user_text.lower()
 
     # Verify tar contains the referenced image path.
     tar_buf.seek(0)
@@ -93,19 +95,21 @@ def test_newline_is_preserved_in_converted_user_text(monkeypatch) -> None:
     row["conversations"][0]["value"] = "line1\nline2\n<image> line3"
     category = conv.infer_subtask_from_row(row)
 
-    def _stub_convert_to_jpeg_and_get_size(_b: bytes):
-        return b"jpeg-bytes", 256, 192
+    def _stub_encode_image_for_pangu_tar(_b: bytes):
+        return b"jpeg-bytes", 256, 192, "image/jpeg"
 
-    monkeypatch.setattr(conv, "convert_to_jpeg_and_get_size", _stub_convert_to_jpeg_and_get_size)
+    monkeypatch.setattr(conv, "encode_image_for_pangu_tar", _stub_encode_image_for_pangu_tar)
 
     tar_buf = io.BytesIO()
     with tarfile.open(fileobj=tar_buf, mode="w") as tf:
         sample = conv.build_pangu_sample(row=row, shard_tar=tf, row_index=0, category=category)
 
     assert sample is not None
-    user_text = sample["data"][0]["content"][1]["text"]["string"]
-    assert "line1\nline2" in user_text
-    assert "<image>" not in user_text.lower()
+    user_content = sample["data"][0]["content"]
+    text_parts = [p for p in user_content if p["type"] == "text"]
+    combined = "\n".join(p["text"]["string"] for p in text_parts)
+    assert "line1\nline2" in combined
+    assert "<image>" not in combined.lower()
 
 
 def test_multiview_distance_not_misclassified_as_grounding(monkeypatch) -> None:
