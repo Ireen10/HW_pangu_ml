@@ -5,8 +5,8 @@ import io
 import json
 import re
 import tarfile
-import itertools
-from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, as_completed, wait as _fut_wait
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,6 +37,10 @@ ROLE_MAP = {"human": "user", "gpt": "assistant"}
 # Pangu image `format` + tar extension: PNG sources stay PNG; everything else -> JPEG.
 MIME_PNG = "image/png"
 MIME_JPEG = "image/jpeg"
+_JPEG_SOI = b"\xff\xd8"
+_PNG_SIG = b"\x89PNG\r\n\x1a\n"
+# Modes safe to store as-is in PNG without re-encoding.
+_PNG_PASSTHROUGH_MODES = frozenset({"RGB", "RGBA", "L", "1"})
 CATEGORY_KEYS = ("category", "sub_category", "subcategory", "ability", "task", "label")
 # Matches common image-placeholder tokens used by different VLMs:
 #   <image>           LLaVA / ShareGPT4V style
@@ -109,7 +113,10 @@ def parse_args() -> argparse.Namespace:
         "--workers",
         type=int,
         default=16,
-        help="Parallel parquet files (process pool). Use 1 to disable parallelism.",
+        help=(
+            "Parallel parquet files (thread pool; I/O + Pillow release the GIL). "
+            "Use 1 for single-threaded streaming."
+        ),
     )
     parser.add_argument(
         "--no-progress",
@@ -678,6 +685,9 @@ def encode_image_for_pangu_tar(image_bytes: bytes) -> Tuple[bytes, int, int, str
     """
     Encode bytes for tar + jsonl: Pillow-detected PNG -> PNG (image/png); else -> JPEG q=95.
 
+    Already-valid JPEG/PNG payloads are passed through without re-encoding (major speedup on
+  large parquet dumps where images are stored as compressed bytes).
+
     On failure, returns raw bytes with geometry -1 and a best-effort mime from magic bytes.
     """
     try:
@@ -687,10 +697,20 @@ def encode_image_for_pangu_tar(image_bytes: bytes) -> Tuple[bytes, int, int, str
             width, height = img.width, img.height
             fmt = (img.format or "").upper()
 
+            if fmt == "JPEG" and image_bytes.startswith(_JPEG_SOI):
+                return image_bytes, width, height, MIME_JPEG
+
+            if (
+                fmt == "PNG"
+                and image_bytes.startswith(_PNG_SIG)
+                and img.mode in _PNG_PASSTHROUGH_MODES
+            ):
+                return image_bytes, width, height, MIME_PNG
+
             if fmt == "PNG":
                 im_out = _prepare_for_png_save(img)
                 buf = io.BytesIO()
-                im_out.save(buf, format="PNG", optimize=True)
+                im_out.save(buf, format="PNG", optimize=False)
                 return buf.getvalue(), width, height, MIME_PNG
 
             im_j = img
@@ -702,7 +722,7 @@ def encode_image_for_pangu_tar(image_bytes: bytes) -> Tuple[bytes, int, int, str
             im_j.save(buf, format="JPEG", quality=95)
             return buf.getvalue(), width, height, MIME_JPEG
     except Exception:
-        mime = MIME_PNG if image_bytes.startswith(b"\x89PNG\r\n\x1a\n") else MIME_JPEG
+        mime = MIME_PNG if image_bytes.startswith(_PNG_SIG) else MIME_JPEG
         return image_bytes, -1, -1, mime
 
 
@@ -807,15 +827,19 @@ def iter_parquet_rows_single_file(
     yielded = 0
     pf = pq.ParquetFile(parquet_file)
     for batch in pf.iter_batches(batch_size=batch_size):
-        column_names = list(batch.schema.names)
-        columns = [batch.column(i) for i in range(batch.num_columns)]
-        for row_idx in range(batch.num_rows):
-            if max_rows is not None and yielded >= max_rows:
-                return
-            row: Dict[str, Any] = {}
-            for name, column in zip(column_names, columns):
-                value = column[row_idx]
-                row[name] = value.as_py() if hasattr(value, "as_py") else value
+        if max_rows is not None and yielded >= max_rows:
+            return
+        n_take = batch.num_rows
+        if max_rows is not None:
+            n_take = min(n_take, max_rows - yielded)
+        if n_take <= 0:
+            return
+        if n_take < batch.num_rows:
+            batch = batch.slice(0, n_take)
+        cols = batch.to_pydict()
+        keys = list(cols.keys())
+        for row_idx in range(n_take):
+            row = {k: cols[k][row_idx] for k in keys}
             yield row
             yielded += 1
 
@@ -846,60 +870,6 @@ def build_parquet_tasks(
         tasks.append((fi, str(path), batch_size, take))
         remaining -= take
     return tasks
-
-
-def _process_parquet_file_task(
-    args: Tuple[int, str, int, Optional[int]],
-) -> Dict[str, Any]:
-    """Worker: process one parquet file (linear scan). Must be top-level for multiprocessing."""
-    file_idx, path_str, batch_size, max_rows = args
-    path = Path(path_str)
-    category_field: Optional[str] = None
-    category_counter: Counter = Counter()
-    data_source_counter: Counter = Counter()
-    image_count_counter: Counter = Counter()
-    resolution_acc = empty_resolution_accumulator()
-    total_seen = 0
-    skipped = 0
-    converted_records: List[Tuple[Dict[str, Any], List[Tuple[str, bytes]]]] = []
-    base_index = file_idx * _INDEX_STRIDE
-
-    for local_idx, row in enumerate(iter_parquet_rows_single_file(path, batch_size, max_rows)):
-        total_seen += 1
-        data_source = normalize_data_source(row.get("data_source"))
-        data_source_counter[data_source] += 1
-
-        images_raw = normalize_scalar(row.get("images"))
-        n_images = len(images_raw) if isinstance(images_raw, list) else 0
-        image_count_counter[n_images] += 1
-
-        cf, cv = extract_category(row)
-        if cv:
-            if category_field is None:
-                category_field = cf or "inferred_subtask_from_prompt"
-            category_counter[cv] += 1
-
-        parts = build_pangu_sample_parts(row, base_index + local_idx, cv)
-        if parts is None:
-            skipped += 1
-            continue
-        sample_dict, _tar = parts
-        accumulate_from_pangu_sample(
-            resolution_acc, sample_dict, normalize_data_source_fn=normalize_data_source
-        )
-        converted_records.append(parts)
-
-    return {
-        "file_idx": file_idx,
-        "total_seen": total_seen,
-        "skipped": skipped,
-        "converted_records": converted_records,
-        "category_counter": dict(category_counter),
-        "data_source_counter": dict(data_source_counter),
-        "image_count_counter": dict(image_count_counter),
-        "resolution_stats_partial": accumulator_to_serializable_dict(resolution_acc),
-        "category_field": category_field,
-    }
 
 
 def create_shard_handles(output_root: Path, shard_id: int):
@@ -965,119 +935,111 @@ def main() -> None:
     )
 
     workers_eff = max(1, args.workers)
+    write_lock = threading.Lock() if workers_eff > 1 else None
+
+    def _merge_file_stats(res: Dict[str, Any]) -> None:
+        stats.total_seen += int(res["total_seen"])
+        stats.skipped += int(res["skipped"])
+        stats.converted += int(res["converted"])
+        category_counter.update(res["category_counter"])
+        data_source_counter.update(res["data_source_counter"])
+        image_count_counter.update(res["image_count_counter"])
+        if res.get("resolution_stats_partial"):
+            merge_resolution_accumulators(resolution_acc, res["resolution_stats_partial"])
+        if stats.category_field is None and res.get("category_field"):
+            stats.category_field = res["category_field"]
+
+    def _write_converted_sample(sample_dict: Dict[str, Any], tar_members: List[Tuple[str, bytes]]) -> None:
+        nonlocal shard_id, shard_written, shard_tar, shard_jsonl
+        for rel_path, img_bytes in tar_members:
+            ti = tarfile.TarInfo(name=rel_path)
+            ti.size = len(img_bytes)
+            shard_tar.addfile(tarinfo=ti, fileobj=io.BytesIO(img_bytes))
+        shard_jsonl.write(json.dumps(sample_dict, ensure_ascii=False) + "\n")
+        shard_written += 1
+        if pbar is not None:
+            pbar.update(1)
+        if shard_written >= args.shard_size:
+            shard_tar.close()
+            shard_jsonl.close()
+            shard_id += 1
+            shard_written = 0
+            shard_tar, shard_jsonl = create_shard_handles(output_root, shard_id)
+
+    def _stream_one_file(
+        fi: int, path_str: str, batch_size: int, max_rows: Optional[int]
+    ) -> Dict[str, Any]:
+        path = Path(path_str)
+        base_index = fi * _INDEX_STRIDE
+        local_category: Counter = Counter()
+        local_data_source: Counter = Counter()
+        local_image_count: Counter = Counter()
+        local_resolution = empty_resolution_accumulator()
+        category_field: Optional[str] = None
+        total_seen = 0
+        skipped = 0
+        converted = 0
+
+        for local_idx, row in enumerate(
+            iter_parquet_rows_single_file(path, batch_size, max_rows)
+        ):
+            total_seen += 1
+            data_source = normalize_data_source(row.get("data_source"))
+            local_data_source[data_source] += 1
+            images_raw = normalize_scalar(row.get("images"))
+            n_images = len(images_raw) if isinstance(images_raw, list) else 0
+            local_image_count[n_images] += 1
+
+            cf, cv = extract_category(row)
+            if cv:
+                if category_field is None:
+                    category_field = cf or "inferred_subtask_from_prompt"
+                local_category[cv] += 1
+
+            parts = build_pangu_sample_parts(row, base_index + local_idx, cv)
+            if parts is None:
+                skipped += 1
+                continue
+
+            sample_dict, tar_members = parts
+            accumulate_from_pangu_sample(
+                local_resolution,
+                sample_dict,
+                normalize_data_source_fn=normalize_data_source,
+            )
+            if write_lock is not None:
+                with write_lock:
+                    _write_converted_sample(sample_dict, tar_members)
+            else:
+                _write_converted_sample(sample_dict, tar_members)
+            converted += 1
+
+        return {
+            "total_seen": total_seen,
+            "skipped": skipped,
+            "converted": converted,
+            "category_counter": dict(local_category),
+            "data_source_counter": dict(local_data_source),
+            "image_count_counter": dict(local_image_count),
+            "resolution_stats_partial": accumulator_to_serializable_dict(local_resolution),
+            "category_field": category_field,
+        }
 
     try:
-        def _write_one_file_result(res: Dict[str, Any]) -> None:
-            nonlocal shard_id, shard_written, shard_tar, shard_jsonl
-            stats.total_seen += int(res["total_seen"])
-            stats.skipped += int(res["skipped"])
-            category_counter.update(res["category_counter"])
-            data_source_counter.update(res["data_source_counter"])
-            image_count_counter.update(res["image_count_counter"])
-            if res.get("resolution_stats_partial"):
-                merge_resolution_accumulators(resolution_acc, res["resolution_stats_partial"])
-            if stats.category_field is None and res.get("category_field"):
-                stats.category_field = res["category_field"]
-
-            for sample_dict, tar_members in res["converted_records"]:
-                for tar_relative_path, image_bytes in tar_members:
-                    tar_info = tarfile.TarInfo(name=tar_relative_path)
-                    tar_info.size = len(image_bytes)
-                    shard_tar.addfile(tarinfo=tar_info, fileobj=io.BytesIO(image_bytes))
-                shard_jsonl.write(json.dumps(sample_dict, ensure_ascii=False) + "\n")
-                stats.converted += 1
-                shard_written += 1
-                if pbar is not None:
-                    pbar.update(1)
-                if shard_written >= args.shard_size:
-                    shard_tar.close()
-                    shard_jsonl.close()
-                    shard_id += 1
-                    shard_written = 0
-                    shard_tar, shard_jsonl = create_shard_handles(output_root, shard_id)
-
         if not tasks:
             pass
         elif workers_eff == 1:
-            # ── Single-process: truly streaming, zero accumulation ────────────
-            # Process each row inline and write to tar/jsonl immediately.
-            # No converted_records list → memory stays constant regardless of
-            # dataset size (only one row's decoded image bytes live at a time).
-            def _stream_one_file(
-                fi: int, path_str: str, batch_size: int, max_rows: Optional[int]
-            ) -> None:
-                nonlocal shard_id, shard_written, shard_tar, shard_jsonl, resolution_acc
-                path = Path(path_str)
-                base_index = fi * _INDEX_STRIDE
-                for local_idx, row in enumerate(
-                    iter_parquet_rows_single_file(path, batch_size, max_rows)
-                ):
-                    stats.total_seen += 1
-                    data_source = normalize_data_source(row.get("data_source"))
-                    data_source_counter[data_source] += 1
-                    images_raw = normalize_scalar(row.get("images"))
-                    n_images = len(images_raw) if isinstance(images_raw, list) else 0
-                    image_count_counter[n_images] += 1
-
-                    cf, cv = extract_category(row)
-                    if cv:
-                        if stats.category_field is None:
-                            stats.category_field = cf or "inferred_subtask_from_prompt"
-                        category_counter[cv] += 1
-
-                    parts = build_pangu_sample_parts(row, base_index + local_idx, cv)
-                    if parts is None:
-                        stats.skipped += 1
-                        continue
-
-                    sample_dict, tar_members = parts
-                    accumulate_from_pangu_sample(
-                        resolution_acc,
-                        sample_dict,
-                        normalize_data_source_fn=normalize_data_source,
-                    )
-                    for rel_path, img_bytes in tar_members:
-                        ti = tarfile.TarInfo(name=rel_path)
-                        ti.size = len(img_bytes)
-                        shard_tar.addfile(tarinfo=ti, fileobj=io.BytesIO(img_bytes))
-                    shard_jsonl.write(json.dumps(sample_dict, ensure_ascii=False) + "\n")
-                    stats.converted += 1
-                    shard_written += 1
-                    if pbar is not None:
-                        pbar.update(1)
-                    if shard_written >= args.shard_size:
-                        shard_tar.close()
-                        shard_jsonl.close()
-                        shard_id += 1
-                        shard_written = 0
-                        shard_tar, shard_jsonl = create_shard_handles(output_root, shard_id)
-
             for fi, path_str, batch_size, max_rows in tasks:
-                _stream_one_file(fi, path_str, batch_size, max_rows)
+                _merge_file_stats(_stream_one_file(fi, path_str, batch_size, max_rows))
         else:
-            # ── Multi-process: bounded sliding-window ─────────────────────────
-            # Pre-allocating ALL futures at once keeps every completed result
-            # (decoded image bytes) alive in Future._result until the entire run
-            # finishes, causing O(files) memory growth and a matching slowdown.
-            # Fix: keep at most (workers × 2) futures in-flight; discard each
-            # Future object as soon as its result has been written so that
-            # Python's reference-counting can immediately free the image bytes.
             max_w = min(workers_eff, len(tasks))
-            _LOOKAHEAD = max_w * 2
-            with ProcessPoolExecutor(max_workers=max_w) as ex:
-                task_iter = iter(tasks)
-                pending: set = set()
-                for t in itertools.islice(task_iter, _LOOKAHEAD):
-                    pending.add(ex.submit(_process_parquet_file_task, t))
-                while pending:
-                    done, pending = _fut_wait(pending, return_when=FIRST_COMPLETED)
-                    for fut in done:
-                        _write_one_file_result(fut.result())
-                        # 'fut' is not stored anywhere after this loop body →
-                        # Future._result (decoded image bytes) freed immediately.
-                        t = next(task_iter, None)
-                        if t is not None:
-                            pending.add(ex.submit(_process_parquet_file_task, t))
+            with ThreadPoolExecutor(max_workers=max_w) as ex:
+                futures = [
+                    ex.submit(_stream_one_file, fi, path_str, batch_size, max_rows)
+                    for fi, path_str, batch_size, max_rows in tasks
+                ]
+                for fut in as_completed(futures):
+                    _merge_file_stats(fut.result())
     finally:
         shard_tar.close()
         shard_jsonl.close()
