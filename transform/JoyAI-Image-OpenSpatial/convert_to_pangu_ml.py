@@ -106,13 +106,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=256,
+        default=512,
         help="Parquet batch size for streaming reads.",
     )
     parser.add_argument(
         "--workers",
         type=int,
-        default=16,
+        default=32,
         help=(
             "Parallel parquet files (thread pool; I/O + Pillow release the GIL). "
             "Use 1 for single-threaded streaming."
